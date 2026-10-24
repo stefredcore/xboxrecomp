@@ -127,6 +127,34 @@ def test_split_translation_passes_manual_set_to_lifter():
     assert batch.translator.seen_manual == {TARGET}
 
 
+def test_manual_call_target_that_is_not_a_function_gets_no_stub():
+    # A hand-written sub_X at an address the detector never split out: only a
+    # call reaches it. It must be declared like any manual function, not
+    # stubbed, or the stub and the hand-written body both define sub_X.
+    class FakeTranslator:
+        def __init__(self):
+            self.owned_function_starts = set()
+            self.lifter = Lifter()
+
+        def translate_function(self, addr, func_info):
+            self.lifter.lift_instruction(_direct_call())
+            return f"void {func_info['name']}(void) {{}}"
+
+    batch = BatchTranslator.__new__(BatchTranslator)
+    batch.translator = FakeTranslator()
+    with tempfile.TemporaryDirectory() as output_dir:
+        stats = batch.translate_batch_split(
+            [(0x00120000, {"name": "sub_00120000"})], output_dir,
+            manual={TARGET})
+        header = open(os.path.join(output_dir, "recomp_funcs.h")).read()
+        stubs_path = os.path.join(output_dir, "recomp_stubs_unresolved.c")
+        stubs = open(stubs_path).read() if os.path.exists(stubs_path) else ""
+
+    assert stats["unresolved_stubs"] == 0
+    assert "void sub_001E9100(void);" in header
+    assert "sub_001E9100" not in stubs
+
+
 def test_wrapped_function_body_is_gen_and_calls_reach_wrapper():
     # --exclude-manual wrap: the body is emitted as sub_X_gen, while direct
     # calls, the header and the dispatch table all name the wrapper sub_X.

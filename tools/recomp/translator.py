@@ -3574,6 +3574,12 @@ class BatchTranslator:
             for addr, name in self.translator.lifter.referenced_calls.items()
             if name not in defined
         }
+        # A hand-written function the detector never split out (a call lands
+        # mid-function, at an epilogue say) is only a call target here. It is
+        # defined by hand all the same: declare it like any manual function.
+        # A stub as well would be a second definition, and the link fails.
+        for addr in sorted(set(unresolved) & manual):
+            manual_decls[addr] = unresolved.pop(addr)
         stats["unresolved_stubs"] = len(unresolved)
         stats["manual_functions"] = len(manual_decls)
         # Instructions the lifter has no translation for become a comment, and

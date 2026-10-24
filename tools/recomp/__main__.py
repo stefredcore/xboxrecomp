@@ -504,6 +504,9 @@ def main():
             # is exactly what membership in `manual` produces.
             newly = {a for a in (skip - wrap) if a in known} - manual
             manual |= newly
+            # Not a detected function, only a call target (mid-function
+            # entry): the translator declares it instead of stubbing it.
+            manual |= (skip - wrap) - known
             print(f"Excluding {len(newly)} functions defined in "
                   f"{args.exclude_manual}"
                   + (f"; {pinned} pinned to sub_ names" if pinned else "")
