@@ -904,6 +904,21 @@ static int backend_draws(void)
     return s_backend && s_backend->draw;
 }
 
+/* RECOMP_GPUBE_SHADOW: the CPU rasteriser draws (clears and triangles) as if
+ * no back end were registered, and the back end is handed the same work as
+ * well -- so a back end can compare its frame with the rasteriser's, frame by
+ * frame, on the same input. */
+int nv2a_backend_shadow(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_GPUBE_SHADOW") != NULL;
+    return on;
+}
+
+static void surface_swizzle_update(void);
+static int s_swz_on;
+
 static void current_surface(Nv2aSurface *out)
 {
     out->color_va        = dma_resolve(s_gpu.color_offset);
@@ -913,6 +928,11 @@ static void current_surface(Nv2aSurface *out)
     out->bytes_per_pixel = surface_bpp();
     out->aa_sx           = s_gpu.aa_sx > 1.5f ? 2 : 1;
     out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
+    /* The same decision the rasteriser makes for its own writes. */
+    surface_swizzle_update();
+    out->swizzled        = (uint32_t)s_swz_on;
+    out->swz_w           = s_swz_on ? 1u << ((s_gpu.format >> 16) & 0xF) : 0;
+    out->swz_h           = s_swz_on ? 1u << ((s_gpu.format >> 24) & 0xF) : 0;
 }
 
 /* Render state in the NV2A's own values, gathered from what the executor
@@ -1000,7 +1020,6 @@ uint32_t nv2a_backend_cube_face_stride(const Nv2aTexture *tex)
  * shadow maps per frame and projects them onto the snow. s_swz_* are set with
  * the surface, before the batch's pixels. RECOMP_SWIZZLED_RT=0 writes
  * row-major. */
-static int s_swz_on;
 static uint32_t s_swz_mx, s_swz_my;
 
 static void surface_swizzle_update(void)
@@ -1036,7 +1055,8 @@ static void clear_surface(uint32_t param)
         s_backend->clear(&surf, &rs, param, s_gpu.clear_color,
                          s_gpu.zstencil_clear);
         s_gpu.clears++;
-        return;
+        if (!nv2a_backend_shadow())
+            return;
     }
     if (!(param & NV097_CLEAR_COLOR_MASK))
         return;                            /* depth/stencil only */
@@ -2281,20 +2301,21 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
         const uint32_t ix[3] = { i0, i1, i2 };
         int k;
 
-        if (!o)
-            return;
-        s_bfull_ok = 0;                    /* drawn as before: no combiners */
-        for (k = 0; k < 3; k++) {
-            o[k].x = p[k][0];
-            o[k].y = p[k][1];
-            o[k].z = p[k][2];
-            o[k].rhw = p[k][3];
-            o[k].diffuse = vertex_color(ix[k]);
-            o[k].u = textured ? uv[k][0] : 0.0f;
-            o[k].v = textured ? uv[k][1] : 0.0f;
+        if (o) {
+            s_bfull_ok = 0;                /* drawn as before: no combiners */
+            for (k = 0; k < 3; k++) {
+                o[k].x = p[k][0];
+                o[k].y = p[k][1];
+                o[k].z = p[k][2];
+                o[k].rhw = p[k][3];
+                o[k].diffuse = vertex_color(ix[k]);
+                o[k].u = textured ? uv[k][0] : 0.0f;
+                o[k].v = textured ? uv[k][1] : 0.0f;
+            }
+            s_bcount += 3;
         }
-        s_bcount += 3;
-        return;
+        if (!nv2a_backend_shadow())
+            return;
     }
     raster_triangle(p[0], p[1], p[2], argb,
                     textured ? (const float (*)[2])uv : NULL);
@@ -2905,7 +2926,8 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
             backend_from_xf(vc, &o[2]);
             s_bcount += 3;
         }
-        return;
+        if (!nv2a_backend_shadow())
+            return;
     }
     for (k = 0; k < 3; k++) {
         if (!s_gpu.xf_seeded)

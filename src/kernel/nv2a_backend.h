@@ -39,7 +39,14 @@ typedef struct {
     uint32_t pitch;             /* bytes per row */
     uint32_t bytes_per_pixel;   /* 2 or 4 */
     uint32_t aa_sx, aa_sy;      /* 1 or 2 each */
+    /* A swizzled surface (SURFACE_FORMAT type 2, render-to-texture): pixel
+     * (x, y) lives at the Morton offset of a swizzled texture of swz_w x swz_h
+     * (d3d8_swizzle.h swizzle_offset), not at y * pitch + x. A back end that
+     * writes such a surface row-major hands the title a scrambled texture. */
+    uint32_t swizzled;
+    uint32_t swz_w, swz_h;
 } Nv2aSurface;
+#define NV2A_BACKEND_SURFACE_SWIZZLE 1   /* the three fields above exist */
 
 /* A texture as the title programmed it. uv in Nv2aVertex are in texels. */
 typedef struct {
@@ -130,6 +137,13 @@ typedef struct {
 /* Register (or, with NULL, remove) the back end. Call before the title starts
  * submitting work; the executor must also be enabled (RECOMP_PB_EXEC). */
 void nv2a_backend_register(const Nv2aBackend *backend);
+
+/* Nonzero with RECOMP_GPUBE_SHADOW set: the CPU rasteriser still draws into
+ * guest memory and the back end gets the same clears and batches on top, so
+ * it can compare its frames with the rasteriser's. A back end in this mode
+ * must not write guest memory. */
+int nv2a_backend_shadow(void);
+#define NV2A_BACKEND_HAS_SHADOW 1
 
 /* Decode a whole texture to 0xAARRGGBB, row-major, width*height entries.
  * Handles every format the executor can sample (swizzled, linear, DXT).
