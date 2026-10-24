@@ -28,6 +28,7 @@
 #define NV2A_BACKEND_H
 
 #include <stdint.h>
+#include "nv2a_combiner.h"
 
 /* The colour surface being drawn into, in real (anti-aliased) pixels.
  * aa_sx/aa_sy give the anti-aliasing factor, so width/aa_sx is the logical
@@ -51,6 +52,12 @@ typedef struct {
      * a linear texture) and the raw SET_TEXTURE_FILTER word (MIN in bits
      * 16-23). A back end that ignores them samples level 0. */
     uint32_t levels, filter;
+    /* Appended for the full pixel pipeline (Nv2aBatch.full): guest address
+     * of the P8 palette, and whether the FORMAT names a cube map. A linear
+     * texture (pitch != 0) is addressed in texels, a swizzled one in [0,1]
+     * coordinates -- the same rule the CPU rasteriser's rc_texel applies. */
+    uint32_t palette;
+    uint32_t cube;
 } Nv2aTexture;
 
 typedef struct {
@@ -82,11 +89,33 @@ typedef struct {
     uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
 } Nv2aRenderState;
 
+/* Everything the CPU rasteriser interpolates per pixel when the register
+ * combiners are in use (xf_rows in nv2a_pb_exec.c): both vertex colours, the
+ * fog factor (already through the fog equation) and all four texture
+ * coordinates as the vertex program wrote them, before the divide by q. */
+typedef struct {
+    float x, y, z, rhw;             /* as in Nv2aVertex */
+    float d0[4], d1[4];             /* r,g,b,a in [0,1] */
+    float fog;                      /* fog factor */
+    float pad[3];
+    float tc[4][4];                 /* texture stage coordinates s,t,r,q */
+} Nv2aVertexFull;
+
 typedef struct {
     const Nv2aVertex  *vertices;    /* triangle list: count is a multiple of 3 */
     uint32_t           count;
     const Nv2aTexture *texture;     /* NULL: untextured */
     const Nv2aRenderState *state;
+
+    /* The full per-pixel pipeline, set when the batch would go through the
+     * register combiners on the CPU rasteriser. NULL `full` means the batch
+     * is drawn as before: texture stage 0 modulated by the diffuse colour. */
+    const Nv2aVertexFull *full;     /* `count` entries, parallel to vertices */
+    const Nv2aCombiner   *combiner;
+    Nv2aTexture           stage[4]; /* valid where stage_valid bit n is set */
+    uint32_t              stage_valid;
+    float                 fog_color[4];      /* r,g,b of SET_FOG_COLOR, a 0 */
+    uint32_t              clip_plane_mode;   /* SET_SHADER_CLIP_PLANE_MODE */
 } Nv2aBatch;
 
 typedef struct {
@@ -106,6 +135,10 @@ void nv2a_backend_register(const Nv2aBackend *backend);
  * Handles every format the executor can sample (swizzled, linear, DXT).
  * Returns 0 if the format is not supported. */
 int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
+
+/* Bytes between the faces of a cube texture (one face with all its mip
+ * levels, 128-byte aligned): face f's level 0 starts at offset + f * this. */
+uint32_t nv2a_backend_cube_face_stride(const Nv2aTexture *tex);
 
 /* Where BACK_END_WRITE_SEMAPHORE_RELEASE (0x1D70) values land: the guest VA
  * of the semaphore the title reads GPU progress from (for XDK D3D, the

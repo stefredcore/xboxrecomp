@@ -10,6 +10,7 @@
  */
 
 #include "kernel.h"
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -199,12 +200,44 @@ static void tz_init(void)
 #endif
 }
 
+/* RECOMP_CONSOLE_REGION=pal: answer as a European console. A PAL title
+ * picks its PAL assets from the factory AV region (XGetVideoStandard reads
+ * it) -- Nightfire's driving image looks for pal\eng\*.mad and the European
+ * menu text, and on an NTSC answer it asks for NTSC\eng movies and the
+ * North-American text table, neither of which the European disc carries.
+ * Unset: the answers this file always gave. */
+static int console_is_pal(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("RECOMP_CONSOLE_REGION");
+        v = e && (e[0] == 'p' || e[0] == 'P');
+    }
+    return v;
+}
+
+#define XC_FACTORY_AV_REGION    0x103
+#define XC_FACTORY_GAME_REGION  0x104
+#define XC_AV_REGION_PAL_I      0x00800300u  /* PAL, 50 Hz */
+#define XC_GAME_REGION_RESTOFWORLD 0x00000004u
+
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength)
 {
     if (!Value)
         return STATUS_INVALID_PARAMETER;
     tz_init();
+
+    if (console_is_pal() && (ValueIndex == XC_FACTORY_AV_REGION
+                             || ValueIndex == XC_FACTORY_GAME_REGION)) {
+        if (ValueLength >= sizeof(ULONG)) {
+            *(PULONG)Value = ValueIndex == XC_FACTORY_AV_REGION
+                           ? XC_AV_REGION_PAL_I : XC_GAME_REGION_RESTOFWORLD;
+            if (Type) *Type = 4;
+            if (ResultLength) *ResultLength = sizeof(ULONG);
+        }
+        return 0;
+    }
 
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_XBOX,
         "ExQueryNonVolatileSetting: index=0x%02X len=%u", ValueIndex, ValueLength);
@@ -251,9 +284,9 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         break;
 
     case XC_DVD_REGION:
-        /* Region 1 (North America) */
+        /* Region 1 (North America), 2 for a European console */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = 1;
+            *(PULONG)Value = console_is_pal() ? 2 : 1;
             if (Type) *Type = 4;
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }
@@ -315,7 +348,7 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         { ULONG v = 1; memcpy(blk + 0x30, &v, 4); }                       /* English */
         { ULONG v = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV; memcpy(blk + 0x34, &v, 4); }
         /* 0x58 is MiscFlags (0); DvdRegion is the last field, at 0x5C. */
-        { ULONG v = 1; memcpy(blk + 0x5C, &v, 4); }                       /* DVD region 1 */
+        { ULONG v = console_is_pal() ? 2 : 1; memcpy(blk + 0x5C, &v, 4); } /* DVD region */
         if (Type) *Type = 3;
         if (ResultLength) *ResultLength = sizeof blk;
         if (ValueLength < sizeof blk)

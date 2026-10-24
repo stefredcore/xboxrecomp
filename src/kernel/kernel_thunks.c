@@ -375,8 +375,18 @@ static const ULONG g_thunk_ordinals[XBOX_KERNEL_THUNK_TABLE_SIZE] = {
 
 static void __stdcall xbox_unresolved_thunk(void)
 {
-    xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THUNK,
-        "Call to unresolved kernel thunk! Return address is on the stack.");
+    static LONG unresolved_calls = 0;
+    LONG call_no = InterlockedIncrement(&unresolved_calls);
+
+    if (getenv("RECOMP_TRACE_UNRESOLVED_CALLS")) {
+        if (call_no <= 64) {
+            xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THUNK,
+                "Call to unresolved kernel thunk! hit=%ld", call_no);
+        }
+    } else if (call_no == 1) {
+        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THUNK,
+            "Call to unresolved kernel thunk! (first hit)");
+    }
 #ifdef _DEBUG
     DebugBreak();
 #endif
@@ -397,6 +407,9 @@ void xbox_kernel_init(void)
     ULONG unresolved = 0;
     uint32_t thunk_base = 0;
     uint32_t thunk_count = 0;
+    int trace_thunk_entry = 0;
+    int trace_thunk_resolve = 0;
+    int trace_thunk_budget = 64;
 
     /* Initialize logging */
     InitializeCriticalSection(&g_log_cs);
@@ -411,6 +424,16 @@ void xbox_kernel_init(void)
         g_log_level = atoi(log_env);
         if (g_log_level < XBOX_LOG_ERROR) g_log_level = XBOX_LOG_ERROR;
         if (g_log_level > XBOX_LOG_TRACE) g_log_level = XBOX_LOG_TRACE;
+    }
+    trace_thunk_entry = getenv("RECOMP_TRACE_THUNK_ENTRY") != NULL;
+    trace_thunk_resolve = getenv("RECOMP_TRACE_THUNK_RESOLVE") != NULL;
+    {
+        const char* budget_env = getenv("RECOMP_TRACE_THUNK_RESOLVE_BUDGET");
+        if (budget_env) {
+            int parsed = atoi(budget_env);
+            if (parsed > 0)
+                trace_thunk_budget = parsed;
+        }
     }
 
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_THUNK,
@@ -427,29 +450,71 @@ void xbox_kernel_init(void)
      * bridge reads). That makes the table match any title's import order.
      * Without a mapped XBE, fall back to the static reference list below. */
     xbox_kernel_get_thunk_address(&thunk_base, &thunk_count);
-    for (ULONG i = 0; i < XBOX_KERNEL_THUNK_TABLE_SIZE; i++) {
-        ULONG ordinal;
+    {
+        ULONG fallback_count = 0;
+        int use_xbe_thunks = (thunk_base != 0 && xbox_GetMemoryBase() != NULL);
 
-        if (thunk_base && i < thunk_count && xbox_GetMemoryBase()) {
-            uint32_t entry = *(volatile uint32_t *)
-                ((uintptr_t)(thunk_base + i * 4) + g_xbox_mem_offset);
-            if (entry == 0) {
-                break;  /* rest of the table is empty */
+        while (fallback_count < XBOX_KERNEL_THUNK_TABLE_SIZE &&
+               g_thunk_ordinals[fallback_count] != 0)
+            fallback_count++;
+
+        for (ULONG i = 0; i < XBOX_KERNEL_THUNK_TABLE_SIZE; i++) {
+            ULONG ordinal;
+            const char *src;
+
+            if (use_xbe_thunks) {
+                uint32_t entry;
+
+                if (i >= thunk_count) {
+                    xbox_kernel_thunk_table[i] = (ULONG_PTR)xbox_unresolved_thunk;
+                    unresolved++;
+                    continue;
+                }
+
+                src = "xbe";
+                entry = *(volatile uint32_t *)
+                    ((uintptr_t)(thunk_base + i * 4) + g_xbox_mem_offset);
+                if (entry == 0) {
+                    break;  /* rest of the table is empty */
+                }
+                ordinal = entry & 0x7FFFFFFF;
+                if (trace_thunk_entry && ((entry & 0x80000000u) == 0 || ordinal == 0)) {
+                    xbox_log(XBOX_LOG_WARN, XBOX_LOG_THUNK,
+                        "Thunk entry suspicious: slot=%u base=0x%08X count=%u entry=0x%08X ordinal=%u",
+                        i, thunk_base, thunk_count, entry, ordinal);
+                }
+            } else {
+                src = "fallback";
+                if (i >= fallback_count) {
+                    xbox_kernel_thunk_table[i] = (ULONG_PTR)xbox_unresolved_thunk;
+                    unresolved++;
+                    continue;
+                }
+                ordinal = g_thunk_ordinals[i];
             }
-            ordinal = entry & 0x7FFFFFFF;
-        } else {
-            ordinal = g_thunk_ordinals[i];
-        }
 
-        ULONG_PTR ptr = xbox_resolve_ordinal(ordinal);
+            if (trace_thunk_resolve && trace_thunk_budget > 0) {
+                xbox_log(XBOX_LOG_INFO, XBOX_LOG_THUNK,
+                    "Thunk resolve: slot=%u src=%s ordinal=%u base=0x%08X count=%u",
+                    i, src, ordinal, thunk_base, thunk_count);
+                trace_thunk_budget--;
+            }
+            if (ordinal == 0) {
+                xbox_log(XBOX_LOG_WARN, XBOX_LOG_THUNK,
+                    "Thunk resolve saw ordinal 0: slot=%u src=%s base=0x%08X count=%u",
+                    i, src, thunk_base, thunk_count);
+            }
 
-        if (ptr) {
-            xbox_kernel_thunk_table[i] = ptr;
-            resolved++;
-        } else {
-            /* Point unresolved thunks to our error handler */
-            xbox_kernel_thunk_table[i] = (ULONG_PTR)xbox_unresolved_thunk;
-            unresolved++;
+            ULONG_PTR ptr = xbox_resolve_ordinal(ordinal);
+
+            if (ptr) {
+                xbox_kernel_thunk_table[i] = ptr;
+                resolved++;
+            } else {
+                /* Point unresolved thunks to our error handler */
+                xbox_kernel_thunk_table[i] = (ULONG_PTR)xbox_unresolved_thunk;
+                unresolved++;
+            }
         }
     }
 

@@ -15,6 +15,8 @@
  */
 
 #include "kernel.h"
+#include <stdio.h>
+#include <stdlib.h>
 
 /* ============================================================================
  * Helper: Convert NT 100ns interval to Win32 milliseconds
@@ -42,13 +44,32 @@ static DWORD xbox_nt_timeout_to_ms(PLARGE_INTEGER Timeout)
         return ms;
     }
 
-    /* Absolute: compute delta from now */
-    LARGE_INTEGER now;
-    GetSystemTimeAsFileTime((LPFILETIME)&now);
-    LONGLONG diff = Timeout->QuadPart - now.QuadPart;
-    if (diff <= 0)
+    /* Absolute timeout. Most callers use FILETIME epoch, but some Xbox code
+     * derives deadlines from KeQueryInterruptTime() (time since boot). */
+    {
+        LARGE_INTEGER now_file;
+        ULONGLONG now_interrupt;
+        LONGLONG diff_file;
+        LONGLONG diff_interrupt;
+
+        GetSystemTimeAsFileTime((LPFILETIME)&now_file);
+        now_interrupt = xbox_KeQueryInterruptTime();
+
+        diff_file = Timeout->QuadPart - now_file.QuadPart;
+        diff_interrupt = Timeout->QuadPart - (LONGLONG)now_interrupt;
+
+        if (diff_file > 0) {
+            DWORD ms = (DWORD)(diff_file / 10000);
+            return (ms == 0) ? 1 : ms;
+        }
+
+        if (diff_interrupt > 0) {
+            DWORD ms = (DWORD)(diff_interrupt / 10000);
+            return (ms == 0) ? 1 : ms;
+        }
+
         return 0;
-    return (DWORD)(diff / 10000);
+    }
 }
 
 /* ============================================================================
@@ -94,6 +115,13 @@ NTSTATUS __stdcall xbox_NtCreateEvent(
 
 NTSTATUS __stdcall xbox_NtSetEvent(HANDLE EventHandle, PLONG PreviousState)
 {
+    static int trace_setevent = -1;
+
+    if (trace_setevent < 0)
+        trace_setevent = getenv("RECOMP_TRACE_SETEVENT") != NULL;
+    if (trace_setevent)
+        fprintf(stderr, "[SETEVENT] NtSetEvent handle=%p\n", EventHandle);
+
     if (PreviousState)
         *PreviousState = 0; /* We don't track previous state */
 
@@ -116,9 +144,15 @@ NTSTATUS __stdcall xbox_NtSetEvent(HANDLE EventHandle, PLONG PreviousState)
 LONG __stdcall xbox_KeSetEvent(PVOID Event, LONG Increment, BOOLEAN Wait)
 {
     HANDLE hEvent = (HANDLE)Event;
+    static int trace_setevent = -1;
 
     (void)Increment;
     (void)Wait;
+
+    if (trace_setevent < 0)
+        trace_setevent = getenv("RECOMP_TRACE_SETEVENT") != NULL;
+    if (trace_setevent)
+        fprintf(stderr, "[SETEVENT] KeSetEvent handle=%p\n", hEvent);
 
     /* We can't easily query previous state, so just set and return 0 */
     SetEvent(hEvent);
@@ -194,13 +228,53 @@ static NTSTATUS xbox_wait_result_to_ntstatus(DWORD result, ULONG count)
     }
 }
 
+static const char* xbox_wait_result_name(DWORD result, ULONG count, LONG *winner)
+{
+    if (winner)
+        *winner = -1;
+    if (result >= WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + count) {
+        if (winner)
+            *winner = (LONG)(result - WAIT_OBJECT_0);
+        return "WAIT_OBJECT_0";
+    }
+    if (result >= WAIT_ABANDONED_0 && result < WAIT_ABANDONED_0 + count) {
+        if (winner)
+            *winner = (LONG)(result - WAIT_ABANDONED_0);
+        return "WAIT_ABANDONED";
+    }
+    switch (result) {
+        case WAIT_TIMEOUT: return "WAIT_TIMEOUT";
+        case WAIT_FAILED: return "WAIT_FAILED";
+        case WAIT_IO_COMPLETION: return "WAIT_IO_COMPLETION";
+        default: return "WAIT_OTHER";
+    }
+}
+
 NTSTATUS __stdcall xbox_NtWaitForSingleObject(
     HANDLE Handle,
     BOOLEAN Alertable,
     PLARGE_INTEGER Timeout)
 {
+    static int trace_wait = -1;
+    static unsigned trace_count;
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
     DWORD result = WaitForSingleObjectEx(Handle, ms, Alertable);
+    if (trace_wait < 0)
+        trace_wait = getenv("RECOMP_TRACE_WAIT_RESULTS") != NULL;
+    if (trace_wait && trace_count++ < 256) {
+        LONG winner;
+        const char *kind = xbox_wait_result_name(result, 1, &winner);
+        fprintf(stderr,
+                "[WAITTRACE] tid=%lu api=NtWaitForSingleObject handle=%p result=%s(0x%08lX)"
+                " winner=%ld timeout_ms=%lu timeout_100ns=%lld path=%s\n",
+                GetCurrentThreadId(), Handle, kind, (unsigned long)result,
+                (long)winner, (unsigned long)ms,
+                (long long)(Timeout ? Timeout->QuadPart : 0),
+                (result == WAIT_TIMEOUT) ? "timeout" :
+                (result >= WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + 1) ? "signaled" :
+                (result == WAIT_FAILED) ? "failed" : "other");
+        fflush(stderr);
+    }
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -210,6 +284,8 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObjectEx(
     BOOLEAN Alertable,
     PLARGE_INTEGER Timeout)
 {
+    static int trace_wait = -1;
+    static unsigned trace_count;
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
     DWORD result;
 
@@ -221,6 +297,22 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObjectEx(
     (void)WaitMode;
 
     result = WaitForSingleObjectEx(Handle, ms, Alertable);
+    if (trace_wait < 0)
+        trace_wait = getenv("RECOMP_TRACE_WAIT_RESULTS") != NULL;
+    if (trace_wait && trace_count++ < 256) {
+        LONG winner;
+        const char *kind = xbox_wait_result_name(result, 1, &winner);
+        fprintf(stderr,
+                "[WAITTRACE] tid=%lu api=NtWaitForSingleObjectEx handle=%p result=%s(0x%08lX)"
+                " winner=%ld timeout_ms=%lu timeout_100ns=%lld path=%s\n",
+                GetCurrentThreadId(), Handle, kind, (unsigned long)result,
+                (long)winner, (unsigned long)ms,
+                (long long)(Timeout ? Timeout->QuadPart : 0),
+                (result == WAIT_TIMEOUT) ? "timeout" :
+                (result >= WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + 1) ? "signaled" :
+                (result == WAIT_FAILED) ? "failed" : "other");
+        fflush(stderr);
+    }
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -231,6 +323,8 @@ NTSTATUS __stdcall xbox_NtWaitForMultipleObjectsEx(
     BOOLEAN Alertable,
     PLARGE_INTEGER Timeout)
 {
+    static int trace_wait = -1;
+    static unsigned trace_count;
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
     BOOL bWaitAll;
     DWORD result;
@@ -239,6 +333,22 @@ NTSTATUS __stdcall xbox_NtWaitForMultipleObjectsEx(
     bWaitAll = (WaitType == 0) ? TRUE : FALSE;
 
     result = WaitForMultipleObjectsEx(Count, Handles, bWaitAll, ms, Alertable);
+    if (trace_wait < 0)
+        trace_wait = getenv("RECOMP_TRACE_WAIT_RESULTS") != NULL;
+    if (trace_wait && trace_count++ < 256) {
+        LONG winner;
+        const char *kind = xbox_wait_result_name(result, Count, &winner);
+        fprintf(stderr,
+                "[WAITTRACE] tid=%lu api=NtWaitForMultipleObjectsEx count=%lu type=%lu"
+                " result=%s(0x%08lX) winner=%ld timeout_ms=%lu timeout_100ns=%lld path=%s\n",
+                GetCurrentThreadId(), (unsigned long)Count, (unsigned long)WaitType,
+                kind, (unsigned long)result, (long)winner, (unsigned long)ms,
+                (long long)(Timeout ? Timeout->QuadPart : 0),
+                (result == WAIT_TIMEOUT) ? "timeout" :
+                (result >= WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + Count) ? "signaled" :
+                (result == WAIT_FAILED) ? "failed" : "other");
+        fflush(stderr);
+    }
     return xbox_wait_result_to_ntstatus(result, Count);
 }
 
@@ -254,12 +364,44 @@ NTSTATUS __stdcall xbox_KeWaitForSingleObject(
     BOOLEAN Alertable,
     PLARGE_INTEGER Timeout)
 {
+    static int trace_enabled = -1;
+    static unsigned trace_failures;
+    static int trace_wait = -1;
+    static unsigned trace_wait_count;
     (void)WaitReason;
     (void)WaitMode;
 
     HANDLE hObject = (HANDLE)Object;
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
     DWORD result = WaitForSingleObjectEx(hObject, ms, Alertable);
+    DWORD win_error = result == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
+    if (trace_enabled < 0)
+        trace_enabled = getenv("RECOMP_TRACE_KEWAIT") != NULL;
+    if (trace_enabled && result == WAIT_FAILED && trace_failures++ < 32) {
+        fprintf(stderr, "[KEWAIT-FAIL] object=%p reason=%u mode=%u alertable=%u"
+                " timeout_ms=%lu timeout_100ns=%lld winerr=%lu\n",
+                hObject, WaitReason, (unsigned)WaitMode, (unsigned)Alertable,
+                (unsigned long)ms,
+                (long long)(Timeout ? Timeout->QuadPart : 0),
+                (unsigned long)win_error);
+        fflush(stderr);
+    }
+    if (trace_wait < 0)
+        trace_wait = getenv("RECOMP_TRACE_WAIT_RESULTS") != NULL;
+    if (trace_wait && trace_wait_count++ < 256) {
+        LONG winner;
+        const char *kind = xbox_wait_result_name(result, 1, &winner);
+        fprintf(stderr,
+                "[WAITTRACE] tid=%lu api=KeWaitForSingleObject object=%p result=%s(0x%08lX)"
+                " winner=%ld timeout_ms=%lu timeout_100ns=%lld path=%s\n",
+                GetCurrentThreadId(), hObject, kind, (unsigned long)result,
+                (long)winner, (unsigned long)ms,
+                (long long)(Timeout ? Timeout->QuadPart : 0),
+                (result == WAIT_TIMEOUT) ? "timeout" :
+                (result >= WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + 1) ? "signaled" :
+                (result == WAIT_FAILED) ? "failed" : "other");
+        fflush(stderr);
+    }
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -273,6 +415,8 @@ NTSTATUS __stdcall xbox_KeWaitForMultipleObjects(
     PLARGE_INTEGER Timeout,
     PVOID WaitBlockArray)
 {
+    static int trace_wait = -1;
+    static unsigned trace_wait_count;
     (void)WaitReason;
     (void)WaitMode;
     (void)WaitBlockArray;
@@ -283,6 +427,25 @@ NTSTATUS __stdcall xbox_KeWaitForMultipleObjects(
     /* Objects[] is an array of PVOID which we treat as HANDLE[] */
     DWORD result = WaitForMultipleObjectsEx(Count, (HANDLE*)Objects,
                                             bWaitAll, ms, Alertable);
+    if (trace_wait < 0)
+        trace_wait = getenv("RECOMP_TRACE_WAIT_RESULTS") != NULL;
+    if (trace_wait && trace_wait_count++ < 512) {
+        LONG winner;
+        const char *kind = xbox_wait_result_name(result, Count, &winner);
+        fprintf(stderr,
+                "[WAITTRACE] tid=%lu api=KeWaitForMultipleObjects count=%lu type=%lu"
+                " result=%s(0x%08lX) winner=%ld timeout_ms=%lu timeout_100ns=%lld path=%s"
+                " h0=%p h1=%p\n",
+                GetCurrentThreadId(), (unsigned long)Count, (unsigned long)WaitType,
+                kind, (unsigned long)result, (long)winner, (unsigned long)ms,
+                (long long)(Timeout ? Timeout->QuadPart : 0),
+                (result == WAIT_TIMEOUT) ? "timeout" :
+                (result >= WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + Count) ? "signaled" :
+                (result == WAIT_FAILED) ? "failed" : "other",
+                Count > 0 ? (HANDLE)Objects[0] : NULL,
+                Count > 1 ? (HANDLE)Objects[1] : NULL);
+        fflush(stderr);
+    }
     return xbox_wait_result_to_ntstatus(result, Count);
 }
 
@@ -330,7 +493,15 @@ static VOID CALLBACK xbox_timer_callback(PVOID lpParameter, BOOLEAN TimerOrWaitF
 {
     PXBOX_KTIMER timer = (PXBOX_KTIMER)lpParameter;
 
+    static int trace_timer = -1;
+
     (void)TimerOrWaitFired;
+
+    if (trace_timer < 0)
+        trace_timer = getenv("RECOMP_TRACE_SETEVENT") != NULL;
+    if (trace_timer)
+        fprintf(stderr, "[SETEVENT] TimerCallback timer=%p event=%p period=%ld\n",
+            (void*)timer, (void*)timer->win32_event, (long)timer->Period);
 
     /* Signal the event so waiters wake up */
     if (timer->win32_event)
@@ -388,9 +559,14 @@ BOOLEAN __stdcall xbox_KeSetTimerEx(
     BOOLEAN was_inserted;
     DWORD due_ms;
     DWORD period_ms;
-
     if (!Timer)
         return FALSE;
+
+    fprintf(stderr, "[SETEVENT-PROBE] KeSetTimerEx entered\n");
+    if (getenv("RECOMP_TRACE_SETEVENT"))
+        fprintf(stderr,
+            (void*)Timer, (void*)Timer->win32_event, (long long)DueTime.QuadPart,
+            (long)Period, (void*)Dpc);
 
     xbox_ensure_timer_queue();
 
@@ -418,10 +594,28 @@ BOOLEAN __stdcall xbox_KeSetTimerEx(
     } else if (DueTime.QuadPart == 0) {
         due_ms = 0;
     } else {
-        LARGE_INTEGER now;
-        GetSystemTimeAsFileTime((LPFILETIME)&now);
-        LONGLONG diff = DueTime.QuadPart - now.QuadPart;
-        due_ms = (diff > 0) ? (DWORD)(diff / 10000) : 0;
+        LARGE_INTEGER now_file;
+        ULONGLONG now_interrupt;
+        LONGLONG diff_file;
+        LONGLONG diff_interrupt;
+
+        GetSystemTimeAsFileTime((LPFILETIME)&now_file);
+        now_interrupt = xbox_KeQueryInterruptTime();
+
+        diff_file = DueTime.QuadPart - now_file.QuadPart;
+        diff_interrupt = DueTime.QuadPart - (LONGLONG)now_interrupt;
+
+        if (diff_file > 0) {
+            due_ms = (DWORD)(diff_file / 10000);
+            if (due_ms == 0)
+                due_ms = 1;
+        } else if (diff_interrupt > 0) {
+            due_ms = (DWORD)(diff_interrupt / 10000);
+            if (due_ms == 0)
+                due_ms = 1;
+        } else {
+            due_ms = 0;
+        }
     }
 
     period_ms = (Period > 0) ? (DWORD)Period : 0;

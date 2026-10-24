@@ -24,10 +24,15 @@
 
 #include <stdint.h>
 
-/* The two MCPX host controllers, as the XDK addresses them. */
-#define XBOX_OHCI0_BASE   0xFED00000u
-#define XBOX_OHCI1_BASE   0xFED08000u
-#define XBOX_OHCI_SIZE    0x00001000u   /* 4 KB, the length XAPI registers */
+/* The two MCPX host controllers, as the XDK addresses them.
+ *
+ * Some titles probe the second controller at 0xFED10000 (64 KiB stride from
+ * HC0) instead of 0xFED08000. Treat it as an alias of HC1 so trapped MMIO does
+ * not fall through as an unhandled access violation. */
+#define XBOX_OHCI0_BASE       0xFED00000u
+#define XBOX_OHCI1_BASE       0xFED08000u
+#define XBOX_OHCI1_ALIAS_BASE 0xFED10000u
+#define XBOX_OHCI_SIZE        0x00001000u   /* 4 KB, the length XAPI registers */
 
 /* Bring the models up. Safe to call more than once; does nothing unless
  * RECOMP_USB is set, so a title that was working without a controller keeps

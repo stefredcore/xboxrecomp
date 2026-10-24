@@ -49,6 +49,8 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 static volatile LONG s_fb_running;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
 static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
+static int           s_trace_fb = -1;
+static int           s_auto_enter_ms = -1;
 
 /* A finished frame, taken at the flip and shown until the next one.
  *
@@ -76,11 +78,41 @@ static uint32_t      s_pvideo_regs[0x1000 / 4];
  * (copied, drawn, then handed back to the title), else the last frame. */
 static void fb_overlay(void)
 {
+    static uint32_t previous[10];
+    static unsigned changes;
+    static int have_previous;
     uint32_t regs[0x1000 / 4];
     unsigned bank;
     bool presented = false;
 
     if (!s_rgb || !nv2a_hook_pvideo_snapshot(regs)) return;
+    {
+        uint32_t current[10] = {
+            regs[NV_PVIDEO_STOP / 4],
+            regs[NV_PVIDEO_BUFFER / 4],
+            regs[(NV_PVIDEO_BASE + 0 * 4) / 4],
+            regs[(NV_PVIDEO_OFFSET + 0 * 4) / 4],
+            regs[(NV_PVIDEO_FORMAT + 0 * 4) / 4],
+            regs[(NV_PVIDEO_SIZE_IN + 0 * 4) / 4],
+            regs[(NV_PVIDEO_BASE + 1 * 4) / 4],
+            regs[(NV_PVIDEO_OFFSET + 1 * 4) / 4],
+            regs[(NV_PVIDEO_FORMAT + 1 * 4) / 4],
+            regs[(NV_PVIDEO_SIZE_IN + 1 * 4) / 4],
+        };
+        if ((!have_previous || memcmp(current, previous, sizeof(current)) != 0)
+                && changes < 24) {
+            memcpy(previous, current, sizeof(current));
+            have_previous = 1;
+            changes++;
+            fprintf(stderr,
+                    "[PVIDEO] stop=%08X buffer=%08X "
+                    "b0=%08X+%08X fmt=%08X size=%08X "
+                    "b1=%08X+%08X fmt=%08X size=%08X\n",
+                    current[0], current[1], current[2], current[3], current[4],
+                    current[5], current[6], current[7], current[8], current[9]);
+            fflush(stderr);
+        }
+    }
     if ((regs[NV_PVIDEO_STOP / 4] & 1u) ||
         (s_pvideo_source &&
          regs[(NV_PVIDEO_SIZE_IN + s_pvideo_bank * 4) / 4] == UINT32_MAX)) {
@@ -121,6 +153,15 @@ static void fb_overlay(void)
         s_pvideo_bank = bank;
         memcpy(s_pvideo_regs, regs, sizeof(s_pvideo_regs));
         presented = true;
+        if (s_trace_fb) {
+            static unsigned pvideo_logs;
+            if (pvideo_logs++ < 96) {
+                fprintf(stderr,
+                        "[FBTRACE] PVIDEO bank=%u phys=%08X pitch=%u height=%u bytes=%zu\n",
+                        bank, (unsigned)physical, pitch, height, (size_t)bytes);
+                fflush(stderr);
+            }
+        }
         nv2a_hook_pvideo_consume(bank);
     }
     if (!presented && s_pvideo_source)
@@ -136,9 +177,22 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
      * it at memory known to have content settles that. */
     const char *pin = getenv("RECOMP_FB_VA");
 
+    if (s_trace_fb < 0)
+        s_trace_fb = getenv("RECOMP_TRACE_FB_PRESENT") != NULL;
+
     s_fb_va = pin ? (uint32_t)strtoul(pin, NULL, 0) : fb_va;
     if (pitch)
         s_fb_pitch = pitch;
+
+    if (s_trace_fb) {
+        static unsigned n;
+        if (n++ < 64) {
+            fprintf(stderr,
+                    "[FBTRACE] Set fb_va=%08X pitch=%u (pin=%s -> active=%08X)\n",
+                    fb_va, pitch, pin ? pin : "", s_fb_va);
+            fflush(stderr);
+        }
+    }
 }
 
 /* Vertical anti-aliasing factor of the surface being shown: 2 for 2x2, where
@@ -158,11 +212,24 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
     LONG next;
     uint32_t bpp, x, y;
 
+    if (s_trace_fb < 0)
+        s_trace_fb = getenv("RECOMP_TRACE_FB_PRESENT") != NULL;
+
     if (!s_fb_running || !fb_va || !pitch)
         return;
     if (getenv("RECOMP_FB_VA"))
         return;                       /* pinned: leave the old path alone */
     next = (s_present_idx == 0) ? 1 : 0;
+    if (s_trace_fb) {
+        static unsigned present_logs;
+        if (present_logs++ < 128) {
+            fprintf(stderr,
+                    "[FBTRACE] Present fb_va=%08X pitch=%u bpp=%u aa_sy=%u idx=%ld->%ld\n",
+                    fb_va, pitch, s_fb_width ? pitch / s_fb_width : 0,
+                    s_fb_aa_sy, (long)s_present_idx, (long)next);
+            fflush(stderr);
+        }
+    }
     if (!s_present[next]) {
         s_present[next] = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height,
                                              4);
@@ -472,6 +539,37 @@ static int fb_show(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
     return 0;
 }
 
+/* The first flipped frame of an image started by a handoff: show the window
+ * that was created hidden in the launcher's place, then tell the launcher
+ * (RECOMP_HANDOFF_EVENT, an inherited event handle) that it can go. Called
+ * every pass with frame=0 too: an image that never flips is shown after 15 s
+ * rather than left in a window nobody can see. */
+static void fb_handoff_shown(HWND hwnd, int frame)
+{
+    static int done;
+    static DWORD t0;
+    const char *ev;
+
+    if (done)
+        return;
+    if (!t0)
+        t0 = GetTickCount();
+    if (!frame && GetTickCount() - t0 < 15000)
+        return;
+    done = 1;
+    ev = getenv("RECOMP_HANDOFF_EVENT");
+    if (!ev || !*ev)
+        return;
+    ShowWindow(hwnd, SW_SHOW);
+    SetForegroundWindow(hwnd);
+    {
+        HANDLE h = (HANDLE)(uintptr_t)_strtoui64(ev, NULL, 10);
+        SetEvent(h);
+        CloseHandle(h);
+    }
+    fprintf(stderr, "  [FBWIN] handoff: window shown, launcher released\n");
+}
+
 static DWORD WINAPI fb_thread(LPVOID unused)
 {
     HWND hwnd;
@@ -511,12 +609,22 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                                && r.bottom - r.top <= work.bottom - work.top))
                 break;
         }
-        hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
-                               WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                               work.left + ((work.right - work.left) - (r.right - r.left)) / 2,
-                               work.top + ((work.bottom - work.top) - (r.bottom - r.top)) / 2,
-                               r.right - r.left, r.bottom - r.top,
-                               NULL, NULL, GetModuleHandleA(NULL), NULL);
+        {
+            /* Started by another image's XLaunchNewImage: take over its
+             * window's place and stay hidden until there is a frame to show,
+             * so the switch reads as one window changing picture rather than
+             * one closing and another opening. */
+            int x = work.left + ((work.right - work.left) - (r.right - r.left)) / 2;
+            int y = work.top + ((work.bottom - work.top) - (r.bottom - r.top)) / 2;
+            int w = r.right - r.left, h = r.bottom - r.top;
+            const char *ho = getenv("RECOMP_HANDOFF_RECT");
+            DWORD style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
+            if (ho && sscanf(ho, "%d,%d,%d,%d", &x, &y, &w, &h) == 4)
+                style &= ~WS_VISIBLE;
+            hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
+                                   style, x, y, w, h,
+                                   NULL, NULL, GetModuleHandleA(NULL), NULL);
+        }
     }
     if (!hwnd) {
         InterlockedExchange(&s_fb_running, 0);
@@ -546,9 +654,21 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     if (gpu_present_enabled())
         gpu_present_init(hwnd, s_fb_width, s_fb_height);
 
+    if (s_auto_enter_ms < 0) {
+        const char *v = getenv("RECOMP_AUTO_ENTER_MS");
+        s_auto_enter_ms = v ? atoi(v) : 0;
+        if (s_auto_enter_ms < 0)
+            s_auto_enter_ms = 0;
+        if (s_auto_enter_ms > 0) {
+            fprintf(stderr, "  [AUTOENTER] armed: %d ms\n", s_auto_enter_ms);
+            fflush(stderr);
+        }
+    }
+
     while (InterlockedCompareExchange(&s_fb_running, 1, 1)) {
         MSG msg;
         int paced = 0;
+        fb_handoff_shown(hwnd, 0);
         while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
@@ -558,17 +678,38 @@ static DWORD WINAPI fb_thread(LPVOID unused)
              * the dump path and GDI see one consistent image even if the
              * next flip lands mid-blit. */
             LONG idx = s_present_idx;
+            if (s_trace_fb) {
+                static LONG last_idx = -2;
+                if (idx != last_idx) {
+                    fprintf(stderr,
+                            "[FBTRACE] show source=present idx=%ld fb_va=%08X pitch=%u\n",
+                            (long)idx, s_fb_va, s_fb_pitch);
+                    fflush(stderr);
+                    last_idx = idx;
+                }
+            }
             if (s_present[idx])
                 memcpy(s_rgb, s_present[idx],
                        (size_t)s_fb_width * s_fb_height * 4);
             if (!fb_pinned)
                 fb_overlay();
             paced = fb_show(hwnd, hdc, &bi);
+            fb_handoff_shown(hwnd, 1);
         } else if (s_fb_va && s_fb_pitch && s_rgb) {
             /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory as
              * before, which is also what a title that never flips needs. */
             const uint8_t *src =
                 (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
+            if (s_trace_fb) {
+                static int logged_direct;
+                if (!logged_direct) {
+                    fprintf(stderr,
+                            "[FBTRACE] show source=direct fb_va=%08X pitch=%u pinned=%d\n",
+                            s_fb_va, s_fb_pitch, fb_pinned);
+                    fflush(stderr);
+                    logged_direct = 1;
+                }
+            }
             fb_convert(src, s_fb_pitch / s_fb_width);
             if (!fb_pinned)
                 fb_overlay();
@@ -610,6 +751,30 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                 tb[127] = 0;
                 SetWindowTextW(hwnd, tb);
                 t0 = now; f0 = f;
+            }
+        }
+        {
+            static DWORD t_start;
+            static DWORD t_down;
+            static int armed = 1;
+            static int key_down;
+            DWORD now = GetTickCount();
+            if (!t_start)
+                t_start = now;
+            if (armed && s_auto_enter_ms > 0 && now - t_start >= (DWORD)s_auto_enter_ms) {
+                xbox_InputKeySet(XBOX_VK_RETURN, 1);
+                key_down = 1;
+                t_down = now;
+                armed = 0;
+                fprintf(stderr, "  [AUTOENTER] key down after %lu ms\n",
+                        (unsigned long)(now - t_start));
+                fflush(stderr);
+            }
+            if (key_down && now - t_down >= 120) {
+                xbox_InputKeySet(XBOX_VK_RETURN, 0);
+                key_down = 0;
+                fprintf(stderr, "  [AUTOENTER] key up\n");
+                fflush(stderr);
             }
         }
         if (!paced)

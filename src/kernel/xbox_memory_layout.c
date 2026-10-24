@@ -20,6 +20,7 @@
 #include "guest_vmem.h"
 #include "kernel_missing.h"
 #include "nv2a_flip_hold.h"
+#include "nv2a/nv2a_mmio_hook.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -786,6 +787,8 @@ static void ac97_arm_write_trap(void)
 
 #define MMIO_APU_BASE 0xFE800000u   /* what MemoryLayoutInit unmaps for the APU */
 #define MMIO_APU_END  0xFE880000u
+#define MMIO_NV2A_PVIDEO_BASE 0xFD008000u
+#define MMIO_NV2A_PVIDEO_END  0xFD009000u
 
 extern MCPXAPUState *g_apu_state;   /* apu_mmio_hook.c; NULL until audio is up */
 
@@ -822,6 +825,9 @@ int xbox_VehMmioFault(void *exception_pointers)
     fault = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
     if (!mmio_fault_va(fault, &va))
         return 0;
+    if (va >= MMIO_NV2A_PVIDEO_BASE && va < MMIO_NV2A_PVIDEO_END)
+        return nv2a_hook_handle_mmio(ep->ContextRecord, fault, va,
+               ep->ExceptionRecord->ExceptionInformation[0] ? 1 : 0);
     if (va >= MMIO_APU_BASE && va < MMIO_APU_END)
         return g_apu_state
             && apu_hook_handle_mmio(ep->ContextRecord, fault, va,
@@ -2369,13 +2375,42 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
 {
     const uint8_t *mem;
     uint32_t esp, i;
+    uint32_t last_esp, last_regs[6];
+    unsigned stalled_secs = 0;
 
     (void)unused;
-    Sleep(s_watchdog_secs * 1000u);
+
+    /* Other guest threads can keep making indirect calls while the entry
+     * thread is stuck, so measure the TLS register file this watchdog owns. */
+    last_esp = s_watchdog_esp ? *s_watchdog_esp : 0;
+    for (i = 0; i < 6; i++)
+        last_regs[i] = s_watchdog_regs[i] ? *s_watchdog_regs[i] : 0;
+    for (;;) {
+        uint32_t now_esp, now_regs[6];
+        int progressed;
+        unsigned reg;
+
+        Sleep(1000u);
+        now_esp = s_watchdog_esp ? *s_watchdog_esp : 0;
+        progressed = now_esp != last_esp;
+        last_esp = now_esp;
+        for (reg = 0; reg < 6; reg++) {
+            now_regs[reg] = s_watchdog_regs[reg] ? *s_watchdog_regs[reg] : 0;
+            if (now_regs[reg] != last_regs[reg])
+                progressed = 1;
+            last_regs[reg] = now_regs[reg];
+        }
+        if (progressed) {
+            stalled_secs = 0;
+            continue;
+        }
+        if (++stalled_secs >= s_watchdog_secs)
+            break;
+    }
 
     mem = (const uint8_t *)g_memory_offset;
     esp = s_watchdog_esp ? *s_watchdog_esp : 0;
-    fprintf(stderr, "[WATCHDOG] no exit after %us; guest esp=0x%08X\n"
+    fprintf(stderr, "[WATCHDOG] no guest progress for %us; guest esp=0x%08X\n"
             "  regs: eax=%08X ecx=%08X edx=%08X ebx=%08X esi=%08X edi=%08X\n",
             s_watchdog_secs, esp,
             s_watchdog_regs[0] ? *s_watchdog_regs[0] : 0,
@@ -3324,7 +3359,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                         XBOX_MCPX_BASE + MCPX_AC97_CODEC_STATUS);
             }
             fprintf(stderr, "  MCPX device aperture: %u MB at Xbox VA "
-                    "0x%08X (APU/AC97/USB/NIC, zeroed)\n",
+                    "0x%08X (APU/AC97/USB/NIC)\n",
                     XBOX_MCPX_SIZE / (1024 * 1024), XBOX_MCPX_BASE);
         } else {
             fprintf(stderr, "  WARNING: MCPX aperture at 0x%08X failed "
@@ -4178,9 +4213,13 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
         int avoid = pass == 0;
         p = (lo_page + align_pages - 1) & ~(align_pages - 1);
         while ((uint64_t)p + n <= limit) {
-            /* A request free to go above 16 MB steps over the low reserve. */
+            /* Keep 15-16 MB available for low-address GPU allocations unless
+             * this request is larger than the entire region above the reserve.
+             * Large render targets otherwise cannot fit despite enough total
+             * contiguous space spanning the reserve. */
             if (limit > CONTIG_LOW_RESERVE_END && p < CONTIG_LOW_RESERVE_END
-                    && p + n > CONTIG_LOW_RESERVE_START) {
+                    && p + n > CONTIG_LOW_RESERVE_START
+                    && n <= CONTIG_USABLE - CONTIG_LOW_RESERVE_END) {
                 p = (CONTIG_LOW_RESERVE_END + align_pages - 1) & ~(align_pages - 1);
                 continue;
             }

@@ -542,6 +542,23 @@ VOID __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalS
     (void)xbox_cs_shadow(CriticalSection);
 }
 
+BOOLEAN __stdcall xbox_RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
+{
+    CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
+    if (!cs)
+        return FALSE;
+    crt_lock_trace("try", CriticalSection);
+    if (!TryEnterCriticalSection(cs)) {
+        /* Same scheduling hint as contended Enter: a spin on TryEnter should
+         * not keep the holder from running. */
+        xbox_GuestCpuBlocked();
+        return FALSE;
+    }
+    InterlockedIncrement(&g_cs_enters);
+    xbox_cs_note_owner(cs);
+    return TRUE;
+}
+
 /* ============================================================================
  * NTSTATUS → Win32 Error Code Mapping
  * ============================================================================ */

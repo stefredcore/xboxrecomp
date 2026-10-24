@@ -1718,12 +1718,25 @@ NTSTATUS __stdcall xbox_NtFsControlFile(
 {
     (void)FileHandle; (void)Event; (void)ApcRoutine; (void)ApcContext;
     (void)InputBuffer; (void)InputBufferLength; (void)OutputBuffer; (void)OutputBufferLength;
-    xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "NtFsControlFile(0x%X) - stub", FsControlCode);
-    if (IoStatusBlock) {
-        IoStatusBlock->Status = STATUS_NOT_IMPLEMENTED;
-        IoStatusBlock->Information = 0;
+
+    switch (FsControlCode) {
+    case 0x00090018u: /* FSCTL_LOCK_VOLUME */
+    case 0x0009001Cu: /* FSCTL_UNLOCK_VOLUME */
+    case 0x00090020u: /* FSCTL_DISMOUNT_VOLUME */
+        if (IoStatusBlock) {
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            IoStatusBlock->Information = 0;
+        }
+        return STATUS_SUCCESS;
+
+    default:
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "NtFsControlFile(0x%X) - stub", FsControlCode);
+        if (IoStatusBlock) {
+            IoStatusBlock->Status = STATUS_NOT_IMPLEMENTED;
+            IoStatusBlock->Information = 0;
+        }
+        return STATUS_NOT_IMPLEMENTED;
     }
-    return STATUS_NOT_IMPLEMENTED;
 }
 
 NTSTATUS __stdcall xbox_NtDeviceIoControlFile(

@@ -24,6 +24,7 @@ static uint8_t *g_nv2a_vram = NULL;
 static int g_mmio_read_count = 0;
 static int g_mmio_write_count = 0;
 static int g_mmio_decode_fail = 0;
+static int g_trace_pvideo_mmio = -1;
 
 /* Global APU state pointer is declared in apu.h and referenced from main.c
  * (regardless of whether the MMIO hook is active). Keep its definition
@@ -443,8 +444,30 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
                   mmio_offset < NV2A_PVIDEO_MMIO + 0x1000u;
     bool handled;
 
+    if (g_trace_pvideo_mmio < 0)
+        g_trace_pvideo_mmio = getenv("RECOMP_TRACE_PVIDEO_MMIO") != NULL;
+
     if (pvideo) AcquireSRWLockExclusive(&g_pvideo_lock);
     handled = decode_and_handle(ctx, mmio_offset, is_write);
+    if (pvideo && handled) {
+        static unsigned trace_count;
+        if (trace_count < 128) {
+            uint32_t value = nv2a_get_state()->pvideo.regs[mmio_offset / 4];
+            if (is_write || g_trace_pvideo_mmio) {
+                fprintf(stderr,
+                        "[PVIDEO] %s off=0x%04X value=0x%08X va=0x%08X fault=%p rip=%p\n",
+                        is_write ? "write" : "read",
+                        mmio_offset - NV2A_PVIDEO_MMIO,
+                        value,
+                        fault_xbox_va,
+                        (void *)fault_addr,
+                        (void *)ctx->Rip);
+                if (++trace_count == 128)
+                    fprintf(stderr, "[PVIDEO] MMIO trace capped at 128 entries\n");
+                fflush(stderr);
+            }
+        }
+    }
     if (pvideo) ReleaseSRWLockExclusive(&g_pvideo_lock);
     return handled;
 }

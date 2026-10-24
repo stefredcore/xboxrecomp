@@ -184,6 +184,8 @@ static unsigned s_ndp = OHCI_PORTS;
 static int s_npads = 1;          /* RECOMP_USB_PADS */
 static int s_enabled;
 static int s_trace;
+static int s_trace_addr;
+static unsigned s_trace_addr_logs;
 
 static uint32_t *reg_of(OhciController *hc, uint32_t off)
 {
@@ -511,11 +513,35 @@ static int guest_ok(uint32_t va, uint32_t bytes)
  * again, forever. */
 static uint32_t bus_resolve(uint32_t addr)
 {
+    const volatile uint8_t *ram_named;
+    const volatile uint8_t *contig_pages;
+    uint32_t resolved = addr;
+
     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
-        return addr;
-    if (addr && addr < xbox_ContiguousAllocatedBytes())
-        return OHCI_CONTIG_BASE + addr;
-    return addr;
+        resolved = addr;
+    else if (addr < OHCI_CONTIG_SIZE) {
+        uint32_t page = addr / 4096u;
+        ram_named = xbox_PhysRamNameMap();
+        if (ram_named[page]) {
+            resolved = addr;
+        } else if (addr < xbox_ContiguousAllocatedBytes()) {
+            contig_pages = xbox_ContiguousPageMap();
+            if (contig_pages[page])
+                resolved = OHCI_CONTIG_BASE + addr;
+        }
+    }
+
+    if (s_trace_addr && s_trace_addr_logs < 128 && resolved != addr) {
+        fprintf(stderr,
+                "  [OHCI-ADDR] phys %08X -> va %08X (image=[%08X,%08X) contig=%u)\n",
+                addr, resolved, g_xbox_image_lo, g_xbox_image_hi,
+                (unsigned)xbox_ContiguousAllocatedBytes());
+        if (++s_trace_addr_logs == 128)
+            fprintf(stderr, "  [OHCI-ADDR] trace capped at 128 entries\n");
+        fflush(stderr);
+    }
+
+    return resolved;
 }
 
 static uint32_t rd32(uint32_t va)
@@ -638,6 +664,16 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             uint8_t rep[32];
             s_n_report++;
             int n = usb_gamepad_report(pad, rep, (int)sizeof rep);
+            if (s_trace && n >= 4) {
+                static uint8_t last[4];
+                if (memcmp(last, rep, 4) != 0) {
+                    memcpy(last, rep, 4);
+                    fprintf(stderr, "  [OHCI%d] report pad %d buttons=%02X analog A=%02X -> guest %08X (bus %08X, image %08X-%08X)\n",
+                            hc->index, pad, rep[2], rep[4], cbp, bus_resolve(cbp),
+                            (unsigned)g_xbox_image_lo, (unsigned)g_xbox_image_hi);
+                    fflush(stderr);
+                }
+            }
             if (n > len) n = len;
             if (n > 0 && guest_ptr(cbp, (uint32_t)n))
                 memcpy(guest_ptr(cbp, (uint32_t)n), rep, (size_t)n);
@@ -1340,6 +1376,8 @@ void xbox_OhciInit(void)
 
     s_enabled = 1;
     s_trace   = getenv("RECOMP_USB_TRACE") != NULL;
+    s_trace_addr = getenv("RECOMP_TRACE_OHCI_ADDR") != NULL;
+    s_trace_addr_logs = 0;
     {
         const char *hcspec = getenv("RECOMP_USB_HC");
         const char *ndpspec = getenv("RECOMP_USB_NDP");
@@ -1401,11 +1439,26 @@ void xbox_OhciInit(void)
                 return;
             }
         }
+
+        /* Some titles probe HC1 at 0xFED10000 (64 KiB stride). Trap that
+         * alias too, so accesses are decoded instead of surfacing as AV. */
+        {
+            DWORD old_protect;
+            LPVOID at = (LPVOID)((uintptr_t)off + XBOX_OHCI1_ALIAS_BASE);
+            if (!VirtualProtect(at, XBOX_OHCI_SIZE, PAGE_NOACCESS,
+                                &old_protect)) {
+                s_enabled = 0;
+                fprintf(stderr, "  OHCI: cannot trap alias 0x%08X (error %lu); "
+                                "disabled\n", XBOX_OHCI1_ALIAS_BASE,
+                                (unsigned long)GetLastError());
+                return;
+            }
+        }
     }
 
-    fprintf(stderr, "  OHCI: two controllers at 0x%08X and 0x%08X, "
-                    "%d ports each, one device on HC0 port 1\n",
-            XBOX_OHCI0_BASE, XBOX_OHCI1_BASE, OHCI_PORTS);
+    fprintf(stderr, "  OHCI: two controllers at 0x%08X and 0x%08X "
+                    "(HC1 alias 0x%08X), %d ports each, one device on HC0 port 1\n",
+            XBOX_OHCI0_BASE, XBOX_OHCI1_BASE, XBOX_OHCI1_ALIAS_BASE, OHCI_PORTS);
     fflush(stderr);
 
     {
@@ -1415,21 +1468,38 @@ void xbox_OhciInit(void)
     }
 }
 
-static OhciController *hc_for(uint32_t va)
+static OhciController *hc_for_with_base(uint32_t va, uint32_t *matched_base)
 {
     int i;
 
     if (!s_enabled)
         return NULL;
-    for (i = 0; i < 2; i++)
-        if (va >= s_hc[i].base && va < s_hc[i].base + XBOX_OHCI_SIZE)
+    for (i = 0; i < 2; i++) {
+        if (va >= s_hc[i].base && va < s_hc[i].base + XBOX_OHCI_SIZE) {
+            if (matched_base)
+                *matched_base = s_hc[i].base;
             return &s_hc[i];
+        }
+    }
+
+    /* Nightfire probes HC1 at +0x10000 from HC0; accept that as HC1 alias. */
+    if (va >= XBOX_OHCI1_ALIAS_BASE && va < XBOX_OHCI1_ALIAS_BASE + XBOX_OHCI_SIZE) {
+        if (matched_base)
+            *matched_base = XBOX_OHCI1_ALIAS_BASE;
+        return &s_hc[1];
+    }
+
     return NULL;
+}
+
+static OhciController *hc_for(uint32_t va)
+{
+    return hc_for_with_base(va, NULL);
 }
 
 int xbox_OhciOwnsAddress(uint32_t xbox_va)
 {
-    return hc_for(xbox_va) != NULL;
+    return hc_for_with_base(xbox_va, NULL) != NULL;
 }
 
 #if defined(OHCI_TRAP_POSIX_A64) || defined(OHCI_TRAP_WIN32)
@@ -1458,34 +1528,40 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
 {
 #if defined(OHCI_TRAP_POSIX_A64)
     ucontext_t *uc = (ucontext_t *)ctx;
-    OhciController *hc = hc_for(xbox_va);
+    uint32_t base = 0;
+    OhciController *hc = hc_for_with_base(xbox_va, &base);
+    uint32_t off;
     int ok;
 
     if (!hc)
         return 0;
-    ok = mmio_emulate_a64(uc, xbox_va - hc->base, hc,
+    off = xbox_va - base;
+    ok = mmio_emulate_a64(uc, off, hc,
                           ohci_read_split, ohci_write_split);
     /* stdio in a signal handler, deliberately: see apu_mmio_hook.c. */
     if (!ok && hc->decode_fail++ < 20) {
         fprintf(stderr, "  [OHCI%d] undecoded access at +0x%03X: insn %08X\n",
-                hc->index, xbox_va - hc->base,
+                hc->index, off,
                 *(const uint32_t *)(uintptr_t)A64_CTX_PC(uc));
         fflush(stderr);
     }
     return ok;
 #elif defined(OHCI_TRAP_WIN32)
-    OhciController *hc = hc_for(xbox_va);
+    uint32_t base = 0;
+    OhciController *hc = hc_for_with_base(xbox_va, &base);
+    uint32_t off;
     int ok;
 
     if (!hc)
         return 0;
-    ok = mmio_emulate((PCONTEXT)ctx, xbox_va - hc->base, hc,
+    off = xbox_va - base;
+    ok = mmio_emulate((PCONTEXT)ctx, off, hc,
                       ohci_read_split, ohci_write_split);
     if (!ok && hc->decode_fail++ < 20) {
         const uint8_t *ip = (const uint8_t *)((PCONTEXT)ctx)->Rip;
         fprintf(stderr, "  [OHCI%d] undecoded access at +0x%03X: "
                         "%02X %02X %02X %02X %02X %02X\n",
-                hc->index, xbox_va - hc->base,
+                hc->index, off,
                 ip[0], ip[1], ip[2], ip[3], ip[4], ip[5]);
         fflush(stderr);
     }

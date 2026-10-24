@@ -239,9 +239,60 @@ static void kernel_data_init(void)
      * a level the way the console would tell it: "+map intro".
      */
     {
+        const char *launch_path = getenv("RECOMP_LAUNCH_PATH");
         const char *cmdline = getenv("RECOMP_CMDLINE");
 
-        if (cmdline && *cmdline) {
+        if (launch_path && *launch_path) {
+            uint32_t page = xbox_HeapAlloc(0x1000 + 0x0C00, 4096);
+            if (page) {
+                const char *title_id = getenv("RECOMP_LAUNCH_TITLEID");
+                unsigned long id = title_id ? strtoul(title_id, NULL, 0) : 0;
+                size_t path_len = strlen(launch_path);
+                size_t cmd_len = cmdline ? strlen(cmdline) : 0;
+
+                if (path_len > 0x3F) path_len = 0x3F;
+                if (cmd_len > 0x0BFF) cmd_len = 0x0BFF;
+                BRIDGE_MEM32(page + 0) = 0;
+                BRIDGE_MEM32(page + 4) = (uint32_t)id;
+                for (size_t i = 0; i < path_len; i++)
+                    BRIDGE_MEM8(page + 8 + (uint32_t)i) =
+                        (uint8_t)launch_path[i];
+                BRIDGE_MEM8(page + 8 + (uint32_t)path_len) = 0;
+                for (size_t i = 0; i < cmd_len; i++)
+                    BRIDGE_MEM8(page + 0x400 + (uint32_t)i) =
+                        (uint8_t)cmdline[i];
+                BRIDGE_MEM8(page + 0x400 + (uint32_t)cmd_len) = 0;
+                BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE) =
+                    page;
+                fprintf(stderr, "  Launch data: type 0 at 0x%08X titleid=0x%08lX path=%s data=%s\n",
+                        page, id, launch_path, cmdline ? cmdline : "");
+
+                /* The launching title's page, byte for byte. Launch data is a
+                 * binary block, not a string: RECOMP_CMDLINE stops at its first
+                 * NUL, and Nightfire's driving image reads its mission past
+                 * that point -- with only "Default" it loads no track at all. */
+                {
+                    const char *file = getenv("RECOMP_LAUNCH_DATA_FILE");
+                    FILE *f = file && *file ? fopen(file, "rb") : NULL;
+                    if (f) {
+                        uint8_t buf[0x1000];
+                        size_t got = fread(buf, 1, sizeof(buf), f);
+                        uint32_t last = 0;
+                        fclose(f);
+                        for (size_t i = 0; i < got; i++) {
+                            BRIDGE_MEM8(page + (uint32_t)i) = buf[i];
+                            if (i >= 0x400 && buf[i])
+                                last = (uint32_t)i;
+                        }
+                        fprintf(stderr, "  Launch data: %zu bytes from %s "
+                                "(type=%u, data ends at +0x%X)\n", got, file,
+                                BRIDGE_MEM32(page), last);
+                    }
+                }
+            } else {
+                BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE) = 0;
+            }
+        } else if (cmdline && *cmdline) {
             uint32_t page = xbox_HeapAlloc(0x1000 + 0x0C00, 4096);
             if (page) {
                 size_t n = strlen(cmdline);
@@ -410,6 +461,7 @@ static long kernel_log_budget(void)
 /* Guest return address of the call currently in a bridge. */
 RECOMP_TLS uint32_t g_xbox_kernel_caller;
 
+
 /* ── Per-ordinal bridge functions ─────────────────────────
  *
  * Each bridge reads args from the Xbox stack, translates pointer
@@ -474,6 +526,7 @@ static int bridge_run_io_apcs(uint32_t alertable, uint32_t wait_mode);
 struct bridge_thread_start {
     recomp_func_t fn;
     uint32_t ctx1, ctx2, stack_top, obj_va, tls_size;
+    uint32_t start_routine;
 };
 
 /* Lay out a thread's TLS the way the Xbox kernel does.
@@ -712,9 +765,16 @@ void guest_cpu_part(void);
 
 static DWORD WINAPI bridge_thread_main(LPVOID param)
 {
+    static int trace_wait = -1;
     struct bridge_thread_start *s = (struct bridge_thread_start *)param;
     recomp_func_t fn = s->fn;
     uint32_t ctx1 = s->ctx1, ctx2 = s->ctx2;
+    uint32_t start_routine = s->start_routine;
+    uint32_t obj_va = s->obj_va;
+    uint32_t stack_top = s->stack_top;
+
+    if (trace_wait < 0)
+        trace_wait = getenv("RECOMP_TRACE_WAIT_RESULTS") != NULL;
 
     /* Own register set (RECOMP_TLS), own simulated stack -- and own TIB.
      *
@@ -744,6 +804,13 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     }
     free(s);
 
+    if (trace_wait) {
+        fprintf(stderr,
+                "[WAITTRACE] tid=%lu api=WorkerThreadStart start=%08X obj=%08X stack_top=%08X ctx1=%08X ctx2=%08X\n",
+                GetCurrentThreadId(), start_routine, obj_va, stack_top, ctx1, ctx2);
+        fflush(stderr);
+    }
+
     /* A guest thread: it drains queued DPCs at its raises and releases
      * (kernel_hal.c) and shares one host core with the others
      * (kernel_thread.c). The timer, ack and device-model threads do
@@ -756,6 +823,12 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 
     fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
     fflush(stderr);
+    if (trace_wait) {
+        fprintf(stderr,
+                "[WAITTRACE] tid=%lu api=WorkerThreadExit start=%08X obj=%08X stack_top=%08X eax=%08X\n",
+                GetCurrentThreadId(), start_routine, obj_va, stack_top, g_eax);
+        fflush(stderr);
+    }
     /* The routine returned instead of calling PsTerminateSystemThread; the
      * stack is still ours to give back. */
     xbox_FreeThreadStack(g_thread_stack_top);
@@ -769,7 +842,8 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 
 static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
                                   uint32_t ctx2, uint32_t stack_top,
-                                  uint32_t obj_va, uint32_t tls_size)
+                                  uint32_t obj_va, uint32_t tls_size,
+                                  uint32_t start_routine)
 {
     struct bridge_thread_start *s = malloc(sizeof(*s));
     HANDLE th;
@@ -778,6 +852,7 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
     s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
     s->obj_va = obj_va;
     s->tls_size = tls_size;
+    s->start_routine = start_routine;
 
     th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
     if (!th) free(s);
@@ -794,16 +869,36 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
  * of the host thread handle, which is what KeWaitForSingleObject waits on. */
 static HANDLE bridge_spawn_guest_thread(recomp_func_t fn, uint32_t ctx1,
                                         uint32_t ctx2, uint32_t stack_top,
-                                        uint32_t handle_va, uint32_t tls_size)
+                                        uint32_t handle_va, uint32_t tls_size,
+                                        uint32_t start_routine)
 {
+    static int trace_wait = -1;
     uint32_t obj = thobj_alloc();
     HANDLE th, shadow = NULL;
 
+    if (trace_wait < 0)
+        trace_wait = getenv("RECOMP_TRACE_WAIT_RESULTS") != NULL;
+
     thobj_ref(obj);
-    th = bridge_spawn_thread(fn, ctx1, ctx2, stack_top, obj, tls_size);
+    th = bridge_spawn_thread(fn, ctx1, ctx2, stack_top, obj, tls_size,
+                             start_routine);
     if (!th) {
+        if (trace_wait) {
+            fprintf(stderr,
+                    "[WAITTRACE] tid=%lu api=WorkerSpawnFailed start=%08X caller=%08X obj=%08X stack_top=%08X gle=%u\n",
+                    GetCurrentThreadId(), start_routine, g_xbox_kernel_caller,
+                    obj, stack_top, GetLastError());
+            fflush(stderr);
+        }
         thobj_unref(obj);   /* the thread's own: it never ran */
     } else {
+        if (trace_wait) {
+            fprintf(stderr,
+                    "[WAITTRACE] tid=%lu api=WorkerSpawned start=%08X caller=%08X obj=%08X stack_top=%08X handle=%p\n",
+                    GetCurrentThreadId(), start_routine, g_xbox_kernel_caller,
+                    obj, stack_top, th);
+            fflush(stderr);
+        }
         if (obj && DuplicateHandle(GetCurrentProcess(), th, GetCurrentProcess(),
                                    &shadow, 0, FALSE, DUPLICATE_SAME_ACCESS))
             ke_shadow_insert(obj, shadow);
@@ -944,7 +1039,7 @@ static void bridge_PsCreateSystemThreadEx(void)
                 } else {
                     bridge_spawn_guest_thread(fn, start_context1, start_context2,
                                               stack_top, xbox_handle_ptr,
-                                              tls_size);
+                                              tls_size, start_routine);
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
                             "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
                             start_routine, start_context1, stack_top);
@@ -1785,6 +1880,123 @@ static void bridge_HalReturnToFirmware(void)
             for (i = 0; i < 8; i++)
                 fprintf(stderr, " %08X", BRIDGE_MEM32(page + 1024 + i * 4));
             fprintf(stderr, "\n");
+
+            /* Nightfire's two images, each recompiled into its own host
+             * program: the launch names the XBE, the XBE names the program.
+             * The main game launches driving.xbe for a driving mission, and
+             * driving.xbe launches default.xbe again when it is over. */
+            {
+                const char *xbe = strrchr(path, ';');
+                const char *target = NULL;
+                xbe = xbe ? xbe + 1 : path;
+                if (_stricmp(xbe, "driving.xbe") == 0)
+                    target = "nightfire_driving.exe";
+                else if (_stricmp(xbe, "default.xbe") == 0)
+                    target = "nightfire.exe";
+                if (target) {
+                char runner[MAX_PATH];
+                DWORD n = GetModuleFileNameA(NULL, runner, sizeof(runner));
+                char *slash = n && n < sizeof(runner)
+                            ? strrchr(runner, '\\') : NULL;
+                if (slash) {
+                    STARTUPINFOA si;
+                    PROCESS_INFORMATION pi;
+                    strcpy(slash + 1, target);
+                    /* Settings the driving image made for itself (main.c,
+                     * NIGHTFIRE_DRIVING) do not travel back to the main game. */
+                    if (getenv("NF_DRIVING_SET_VBLANK")) {
+                        SetEnvironmentVariableA("RECOMP_VBLANK", NULL);
+                        SetEnvironmentVariableA("NF_DRIVING_SET_VBLANK", NULL);
+                    }
+                    if (getenv("NF_DRIVING_SET_RECLAIM")) {
+                        SetEnvironmentVariableA("RECOMP_HEAP_RECLAIM", NULL);
+                        SetEnvironmentVariableA("NF_DRIVING_SET_RECLAIM", NULL);
+                    }
+                    memset(&si, 0, sizeof(si));
+                    memset(&pi, 0, sizeof(pi));
+                    si.cb = sizeof(si);
+                    si.dwFlags = STARTF_USESTDHANDLES;
+                    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+                    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+                    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+                    SetEnvironmentVariableA("RECOMP_LAUNCH_PATH", path);
+                    SetEnvironmentVariableA("RECOMP_LAUNCH_TITLEID", "0x45410026");
+                    SetEnvironmentVariableA("RECOMP_CMDLINE", "Default");
+                    SetEnvironmentVariableA("RECOMP_DRIVING_CHILD", NULL);
+                    /* Hand over the whole page: the launch data is binary and
+                     * the mission number sits past the "Default" string. */
+                    {
+                        char file[MAX_PATH];
+                        DWORD tn = GetTempPathA(sizeof(file), file);
+                        FILE *f = NULL;
+                        if (tn && tn < sizeof(file) - 32) {
+                            strcat(file, "nightfire_launch_data.bin");
+                            f = fopen(file, "wb");
+                        }
+                        if (f) {
+                            fwrite(&BRIDGE_MEM8(page), 1, 0x1000, f);
+                            fclose(f);
+                            SetEnvironmentVariableA("RECOMP_LAUNCH_DATA_FILE", file);
+                            fprintf(stderr, "  [KERNEL] launch data page -> %s\n", file);
+                        } else {
+                            fprintf(stderr, "  [KERNEL] could not save the launch data page;"
+                                            " the driving image gets only \"Default\"\n");
+                        }
+                    }
+                    /* One window across the switch: the new image opens its
+                     * window hidden where ours is, and says when it has a
+                     * frame up; ours stays on screen until then. On hardware
+                     * the reboot shows nothing either way, but two windows
+                     * closing and opening read as two games. */
+                    HANDLE handoff = NULL;
+                    {
+                        SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+                        HWND w = FindWindowA("XboxRecompFramebuffer", NULL);
+                        DWORD owner = 0;
+                        if (w)
+                            GetWindowThreadProcessId(w, &owner);
+                        if (w && owner == GetCurrentProcessId()) {
+                            RECT wr;
+                            char buf[64];
+                            GetWindowRect(w, &wr);
+                            snprintf(buf, sizeof(buf), "%ld,%ld,%ld,%ld",
+                                     (long)wr.left, (long)wr.top,
+                                     (long)(wr.right - wr.left),
+                                     (long)(wr.bottom - wr.top));
+                            SetEnvironmentVariableA("RECOMP_HANDOFF_RECT", buf);
+                            /* fb_toggle_fullscreen drops the caption. */
+                            if (!(GetWindowLongA(w, GWL_STYLE) & WS_CAPTION))
+                                SetEnvironmentVariableA("RECOMP_FULLSCREEN", "1");
+                            handoff = CreateEventA(&sa, TRUE, FALSE, NULL);
+                            if (handoff) {
+                                snprintf(buf, sizeof(buf), "%llu",
+                                         (unsigned long long)(uintptr_t)handoff);
+                                SetEnvironmentVariableA("RECOMP_HANDOFF_EVENT", buf);
+                            }
+                        }
+                    }
+                    fprintf(stderr, "  [KERNEL] launching %s\n", runner);
+                    fflush(stderr);
+                    if (CreateProcessA(runner, NULL, NULL, NULL, TRUE, 0,
+                                       NULL, NULL, &si, &pi)) {
+                        CloseHandle(pi.hThread);
+                        if (handoff) {
+                            HANDLE waits[2] = { handoff, pi.hProcess };
+                            DWORD r = WaitForMultipleObjects(2, waits, FALSE, 30000);
+                            fprintf(stderr, "  [KERNEL] handoff: %s\n",
+                                    r == WAIT_OBJECT_0 ? "new image is on screen"
+                                    : r == WAIT_OBJECT_0 + 1 ? "new image exited first"
+                                    : "timed out waiting for the new image");
+                            fflush(stderr);
+                        }
+                        CloseHandle(pi.hProcess);
+                        ExitProcess(0);
+                    }
+                    fprintf(stderr, "  [KERNEL] could not start %s (error %lu)\n",
+                            runner, (unsigned long)GetLastError());
+                }
+                }
+            }
         } else {
             fprintf(stderr, "  [KERNEL] no launch data page set\n");
         }
@@ -1911,14 +2123,46 @@ static void bridge_RtlInitializeCriticalSection(void)
 
 static void bridge_RtlEnterCriticalSection(void)
 {
+    static int trace_cs = -1;
+    static uint32_t trace_budget = 0;
     uint32_t cs_va = STACK_ARG(0);
+
+    if (trace_cs < 0) {
+        trace_cs = getenv("RECOMP_TRACE_CS_LOOP") != NULL;
+        trace_budget = 400;
+    }
+
+    if (trace_cs && trace_budget > 0) {
+        fprintf(stderr,
+                "[CS-LOOP] op=enter caller=%08X cs=%08X native=%p\n",
+                g_xbox_kernel_caller, cs_va, XBOX_TO_NATIVE(cs_va));
+        fflush(stderr);
+        trace_budget--;
+    }
+
     xbox_RtlEnterCriticalSection(XBOX_TO_NATIVE(cs_va));
     g_eax = 0;
 }
 
 static void bridge_RtlLeaveCriticalSection(void)
 {
+    static int trace_cs = -1;
+    static uint32_t trace_budget = 0;
     uint32_t cs_va = STACK_ARG(0);
+
+    if (trace_cs < 0) {
+        trace_cs = getenv("RECOMP_TRACE_CS_LOOP") != NULL;
+        trace_budget = 400;
+    }
+
+    if (trace_cs && trace_budget > 0) {
+        fprintf(stderr,
+                "[CS-LOOP] op=leave caller=%08X cs=%08X native=%p\n",
+                g_xbox_kernel_caller, cs_va, XBOX_TO_NATIVE(cs_va));
+        fflush(stderr);
+        trace_budget--;
+    }
+
     xbox_RtlLeaveCriticalSection(XBOX_TO_NATIVE(cs_va));
     g_eax = 0;
 }
@@ -1981,22 +2225,31 @@ static void bridge_NtCreateEvent(void)
 }
 
 static HANDLE ke_shadow_lookup(uint32_t guest_va);
+static uint32_t ke_shadow_lookup_guest(HANDLE host);
 static void ke_shadow_insert(uint32_t guest_va, HANDLE host);
 static HANDLE bridge_resolve_handle(uint32_t token);
+static uint32_t trace_resolve_guest_from_token(uint32_t token, HANDLE *out_handle);
 static HANDLE ke_guest_event(uint32_t guest_va, int *type);
+static void ke_guest_event_wait_ref(uint32_t guest_va, int delta);
 
 /* Bring a header-owned host event in line with guest SignalState before a
- * wait. Explicitly initialized shadows keep their existing host-state policy. */
+ * wait. Explicitly initialized shadows keep their existing host-state policy.
+ *
+ * For synchronization events we do not force a reset when guest state is 0:
+ * producer-side signaling can happen through a different host handle instance
+ * (same kernel object), and blindly resetting here would erase that signal
+ * before WaitAny can observe it. */
 static HANDLE ke_guest_event_prepare(uint32_t guest_va, int *type)
 {
     HANDLE h = ke_guest_event(guest_va, type);
     if (h) {
-        if (BRIDGE_MEM32(guest_va + 4) == 0) {
+        uint32_t guest_signaled = BRIDGE_MEM32(guest_va + 4) != 0;
+        if (guest_signaled) {
+            SetEvent(h);
+        } else if (*type == 0) {
             ResetEvent(h);
             if (BRIDGE_MEM32(guest_va + 4) != 0) /* set meanwhile */
                 SetEvent(h);
-        } else {
-            SetEvent(h);
         }
     }
     return h;
@@ -2037,6 +2290,9 @@ static void bridge_KeSetEvent(void)
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
 static void bridge_KeWaitForSingleObject(void)
 {
+    static int trace_enabled = -1;
+    static int trace_wait = -1;
+    static unsigned trace_calls;
     uint32_t object = STACK_ARG(0);
     uint32_t wait_reason = STACK_ARG(1);
     uint32_t wait_mode = STACK_ARG(2);
@@ -2044,15 +2300,38 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t timeout_ptr = STACK_ARG(4);
     HANDLE h;
 
+    if (trace_enabled < 0)
+        trace_enabled = getenv("RECOMP_TRACE_KEWAIT") != NULL;
+    if (trace_wait < 0)
+        trace_wait = getenv("RECOMP_TRACE_WAIT_RESULTS") != NULL;
+
     {   /* An event the title built itself (see ke_guest_event). Its
          * SignalState in guest memory is the truth -- XDK code resets it by
          * writing 0 there -- so bring the host event in line first. */
         int type;
         HANDLE ge = ke_guest_event_prepare(object, &type);
         if (ge) {
+            ke_guest_event_wait_ref(object, 1);
             g_eax = (uint32_t)xbox_KeWaitForSingleObject(
                 ge, wait_reason, wait_mode,
                 (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+            ke_guest_event_wait_ref(object, -1);
+            if (trace_enabled && trace_calls++ < 32) {
+                fprintf(stderr, "[KEWAIT] path=guest-event object=%08X handle=%p"
+                        " type=%d args=%08X,%08X,%08X,%08X,%08X status=%08X\n",
+                        object, ge, type, object, wait_reason, wait_mode,
+                        alertable, timeout_ptr, g_eax);
+                fflush(stderr);
+            }
+            if (trace_wait) {
+                const char *path = (g_eax == STATUS_TIMEOUT) ? "timeout" :
+                                   (g_eax == STATUS_UNSUCCESSFUL) ? "failed" : "signaled";
+                fprintf(stderr,
+                        "[WAITTRACE] tid=%lu api=bridge_KeWaitForSingleObject object=%08X handle=%p"
+                        " guest_event=%08X status=%08X path=%s\n",
+                        GetCurrentThreadId(), object, ge, object, g_eax, path);
+                fflush(stderr);
+            }
             if (g_eax == 0 && type == 1)               /* synchronization: consumed */
                 BRIDGE_MEM32(object + 4) = 0;
             return;
@@ -2068,6 +2347,22 @@ static void bridge_KeWaitForSingleObject(void)
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
         h, wait_reason, wait_mode,
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+    if (trace_enabled && trace_calls++ < 32) {
+        fprintf(stderr, "[KEWAIT] path=handle object=%08X handle=%p"
+                " args=%08X,%08X,%08X,%08X,%08X status=%08X\n",
+                object, h, object, wait_reason, wait_mode, alertable,
+                timeout_ptr, g_eax);
+        fflush(stderr);
+    }
+    if (trace_wait) {
+        const char *path = (g_eax == STATUS_TIMEOUT) ? "timeout" :
+                           (g_eax == STATUS_UNSUCCESSFUL) ? "failed" : "signaled";
+        fprintf(stderr,
+                "[WAITTRACE] tid=%lu api=bridge_KeWaitForSingleObject object=%08X handle=%p"
+                " guest_event=%08X status=%08X path=%s\n",
+                GetCurrentThreadId(), object, h, 0u, g_eax, path);
+        fflush(stderr);
+    }
 }
 
 /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
@@ -2094,8 +2389,25 @@ static void bridge_NtWaitForSingleObject(void)
  * before each async map read; a no-op here left the event stuck signalled. */
 static void bridge_NtClearEvent(void)
 {
-    HANDLE handle = bridge_resolve_handle(STACK_ARG(0));
+    static int trace_wait = -1;
+    uint32_t token = STACK_ARG(0);
+    HANDLE handle = NULL;
+    uint32_t guest = 0;
+
+    if (trace_wait < 0)
+        trace_wait = getenv("RECOMP_TRACE_WAIT_RESULTS") != NULL;
+
+    guest = trace_resolve_guest_from_token(token, &handle);
     g_eax = (uint32_t)xbox_NtClearEvent(handle);
+    if (guest)
+        BRIDGE_MEM32(guest + 4) = 0;
+
+    if (trace_wait) {
+        fprintf(stderr,
+                "[WAITTRACE] tid=%lu api=NtClearEvent token=%08X handle=%p guest=%08X status=%08X\n",
+                GetCurrentThreadId(), token, handle, guest, g_eax);
+        fflush(stderr);
+    }
 }
 
 /* ── NtSetEvent (ordinal 225) ────────────────────────────── */
@@ -2105,9 +2417,15 @@ static void bridge_NtClearEvent(void)
  * context's go-event and only the first 14 KB of the map ever loaded. */
 static void bridge_NtSetEvent(void)
 {
-    HANDLE   handle = bridge_resolve_handle(STACK_ARG(0));
-    uint32_t prev   = STACK_ARG(1);
+    uint32_t token = STACK_ARG(0);
+    uint32_t prev  = STACK_ARG(1);
+    HANDLE handle = NULL;
+    uint32_t guest = 0;
+
+    guest = trace_resolve_guest_from_token(token, &handle);
     g_eax = (uint32_t)xbox_NtSetEvent(handle, XBOX_TO_NATIVE(prev));
+    if (guest)
+        BRIDGE_MEM32(guest + 4) = 1;
 }
 
 /* ── NtPulseEvent (ordinal 205) ──────────────────────────── */
@@ -2117,9 +2435,27 @@ static void bridge_NtSetEvent(void)
  * faithfully -- a waiter not yet blocked misses it, exactly as on hardware. */
 static void bridge_NtPulseEvent(void)
 {
-    HANDLE handle = bridge_resolve_handle(STACK_ARG(0));
-    if (handle) PulseEvent(handle);
+    static int trace_wait = -1;
+    uint32_t token = STACK_ARG(0);
+    HANDLE handle = NULL;
+    uint32_t guest = 0;
+
+    if (trace_wait < 0)
+        trace_wait = getenv("RECOMP_TRACE_WAIT_RESULTS") != NULL;
+
+    guest = trace_resolve_guest_from_token(token, &handle);
+    if (handle)
+        PulseEvent(handle);
+    if (guest)
+        BRIDGE_MEM32(guest + 4) = 0;
     g_eax = 0;
+
+    if (trace_wait) {
+        fprintf(stderr,
+                "[WAITTRACE] tid=%lu api=NtPulseEvent token=%08X handle=%p guest=%08X status=%08X\n",
+                GetCurrentThreadId(), token, handle, guest, g_eax);
+        fflush(stderr);
+    }
 }
 
 /* ── NtWaitForSingleObjectEx (ordinal 234) ───────────────── */
@@ -3802,9 +4138,28 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
                              long period_ms, uint32_t dpc_va)
 {
-    long long delay_ms = (due_100ns < 0) ? (-due_100ns) / 10000 : 0;
+    long long delay_ms;
     int i, free_slot = -1;
     uint32_t was_set = 0;
+
+    if (due_100ns < 0) {
+        long long rel_100ns = -due_100ns;
+        delay_ms = rel_100ns / 10000;
+        if (delay_ms == 0 && rel_100ns > 0)
+            delay_ms = 1;
+    } else if (due_100ns > 0) {
+        ULONGLONG now_100ns = xbox_KeQueryInterruptTime();
+        long long delta_100ns = due_100ns - (long long)now_100ns;
+        if (delta_100ns <= 0) {
+            delay_ms = 0;
+        } else {
+            delay_ms = delta_100ns / 10000;
+            if (delay_ms == 0)
+                delay_ms = 1;
+        }
+    } else {
+        delay_ms = 0;
+    }
 
     if (!g_timer_started) {
         InitializeCriticalSection(&g_timer_lock);
@@ -4286,10 +4641,14 @@ static NTSTATUS bridge_create_file_impl(
  */
 static void bridge_RtlEqualString(void)
 {
+    static int trace_rtl_strings = -1;
     uint32_t s1_va  = STACK_ARG(0);
     uint32_t s2_va  = STACK_ARG(1);
     uint32_t nocase = STACK_ARG(2);
     XBOX_ANSI_STRING a, b;
+
+    if (trace_rtl_strings < 0)
+        trace_rtl_strings = getenv("RECOMP_TRACE_RTL_STRINGS") != NULL;
 
     if (!s1_va || !s2_va) {
         g_eax = 0;
@@ -4302,17 +4661,40 @@ static void bridge_RtlEqualString(void)
     b.MaximumLength = BRIDGE_MEM16(s2_va + 2);
     b.Buffer        = (PCHAR)XBOX_TO_NATIVE(BRIDGE_MEM32(s2_va + 4));
 
+    if (a.Length == 0 && b.Length == 0) {
+        g_eax = 1;
+        return;
+    }
+
     if (!a.Buffer || !b.Buffer) {
         g_eax = 0;
         return;
     }
     g_eax = xbox_RtlEqualString(&a, &b, (BOOLEAN)nocase) ? 1 : 0;
+
+    if (trace_rtl_strings &&
+        (g_xbox_kernel_caller == 0x001131F3u ||
+         g_xbox_kernel_caller == 0x001131E3u ||
+         g_xbox_kernel_caller == 0x001131C7u)) {
+        fprintf(stderr,
+                "[RTL-STR] caller=%08X eq=%u nocase=%u s1={len=%u max=%u buf=%08X} s2={len=%u max=%u buf=%08X}\n",
+                g_xbox_kernel_caller, g_eax, nocase,
+                (unsigned)a.Length, (unsigned)a.MaximumLength,
+                BRIDGE_MEM32(s1_va + 4),
+                (unsigned)b.Length, (unsigned)b.MaximumLength,
+                BRIDGE_MEM32(s2_va + 4));
+        fflush(stderr);
+    }
 }
 
 static void bridge_RtlInitAnsiString(void)
 {
+    static int trace_rtl_strings = -1;
     uint32_t dest_va = STACK_ARG(0);
     uint32_t src_va  = STACK_ARG(1);
+
+    if (trace_rtl_strings < 0)
+        trace_rtl_strings = getenv("RECOMP_TRACE_RTL_STRINGS") != NULL;
 
     if (!dest_va) {
         g_eax = 0;
@@ -4332,6 +4714,19 @@ static void bridge_RtlInitAnsiString(void)
         BRIDGE_MEM16(dest_va + 2) = 0;
         BRIDGE_MEM32(dest_va + 4) = 0;
     }
+
+    if (trace_rtl_strings &&
+        (g_xbox_kernel_caller == 0x001131E3u ||
+         g_xbox_kernel_caller == 0x001131C7u ||
+         g_xbox_kernel_caller == 0x00110092u)) {
+        fprintf(stderr,
+                "[RTL-STR] caller=%08X init dest=%08X src=%08X len=%u max=%u\n",
+                g_xbox_kernel_caller, dest_va, src_va,
+                (unsigned)BRIDGE_MEM16(dest_va + 0),
+                (unsigned)BRIDGE_MEM16(dest_va + 2));
+        fflush(stderr);
+    }
+
     g_eax = 0;
 }
 
@@ -5249,11 +5644,18 @@ static void bridge_NtDeviceIoControlFile(void)
 /* ── NtFsControlFile (ordinal 200, 10 args = 40 bytes) ──── */
 static void bridge_NtFsControlFile(void)
 {
-    uint32_t fsctl = STACK_ARG(5);
     uint32_t ios_va = STACK_ARG(4);
-    fprintf(stderr, "  [FILE] NtFsControlFile(0x%X) - stub\n", fsctl);
-    bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
-    g_eax = 0xC00000BBu;
+    NTSTATUS st = xbox_NtFsControlFile(
+        bridge_resolve_handle(STACK_ARG(0)),
+        bridge_resolve_handle(STACK_ARG(1)),
+        (PIO_APC_ROUTINE)XBOX_TO_NATIVE(STACK_ARG(2)),
+        XBOX_TO_NATIVE(STACK_ARG(3)),
+        ios_va ? (PXBOX_IO_STATUS_BLOCK)XBOX_TO_NATIVE(ios_va) : NULL,
+        STACK_ARG(5),
+        XBOX_TO_NATIVE(STACK_ARG(6)), STACK_ARG(7),
+        XBOX_TO_NATIVE(STACK_ARG(8)), STACK_ARG(9));
+
+    g_eax = (uint32_t)st;
 }
 
 /* ── NtCreateDirectoryObject (ordinal 188) ──────────────── */
@@ -5817,11 +6219,27 @@ static void bridge_NtCreateSemaphore(void)
  * Handle token in, LONG by value, optional 4-byte PLONG out. */
 static void bridge_NtReleaseSemaphore(void)
 {
+    static int trace_wait = -1;
+    uint32_t token = STACK_ARG(0);
+    LONG adjustment = (LONG)STACK_ARG(1);
     uint32_t count_va = STACK_ARG(2);
+    HANDLE handle = NULL;
+    uint32_t guest = 0;
 
+    if (trace_wait < 0)
+        trace_wait = getenv("RECOMP_TRACE_WAIT_RESULTS") != NULL;
+
+    guest = trace_resolve_guest_from_token(token, &handle);
     g_eax = (uint32_t)xbox_NtReleaseSemaphore(
-        bridge_resolve_handle(STACK_ARG(0)), (LONG)STACK_ARG(1),
+        handle, adjustment,
         count_va ? (PLONG)XBOX_TO_NATIVE(count_va) : NULL);
+
+    if (trace_wait) {
+        fprintf(stderr,
+                "[WAITTRACE] tid=%lu api=NtReleaseSemaphore token=%08X handle=%p guest=%08X adj=%ld status=%08X\n",
+                GetCurrentThreadId(), token, handle, guest, (long)adjustment, g_eax);
+        fflush(stderr);
+    }
 }
 
 /* ── KeAlertThread (ordinal 93, 2 args)
@@ -5843,6 +6261,8 @@ static void bridge_KeAlertThread(void)
 
 static void bridge_KeWaitForMultipleObjects(void)
 {
+    static int trace_objects = -1;
+    static unsigned trace_object_count;
     uint32_t count      = STACK_ARG(0);
     uint32_t objects_va = STACK_ARG(1);
     uint32_t wait_type  = STACK_ARG(2);
@@ -5859,6 +6279,8 @@ static void bridge_KeWaitForMultipleObjects(void)
     }
     if (count > BRIDGE_MAXIMUM_WAIT_OBJECTS)
         count = BRIDGE_MAXIMUM_WAIT_OBJECTS;
+    if (trace_objects < 0)
+        trace_objects = getenv("RECOMP_TRACE_WAIT_OBJECTS") != NULL;
     for (i = 0; i < count; i++) {
         uint32_t object = objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0;
         handles[i] = ke_guest_event_prepare(object, &event_types[i]);
@@ -5868,6 +6290,35 @@ static void bridge_KeWaitForMultipleObjects(void)
             handles[i] = ke_shadow_lookup(object);
             if (!handles[i])
                 handles[i] = bridge_resolve_handle(object);
+            if (!handles[i] && object)
+                handles[i] = XBOX_TO_NATIVE(object);
+        }
+    }
+
+    if (trace_objects && trace_object_count++ < 64) {
+        fprintf(stderr,
+                "[WAITOBJECTS] tid=%lu count=%lu type=%lu timeout_va=%08X\n",
+                GetCurrentThreadId(), (unsigned long)count,
+                (unsigned long)wait_type, timeout_va);
+        for (i = 0; i < count; i++) {
+            uint32_t object = objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0;
+            uint32_t header = 0, signal = 0, size = 0;
+            DWORD thread_id = GetThreadId(handles[i]);
+
+            if ((object >= 0x00010000u && object < 0x04000000u) ||
+            (object >= 0x80000000u && object < 0x84000000u)) {
+            header = BRIDGE_MEM32(object);
+            signal = BRIDGE_MEM32(object + 4);
+            size = BRIDGE_MEM32(object + 8);
+            }
+            fprintf(stderr,
+                    "[WAITOBJECTS]   index=%lu guest=%08X host=%p event=%08X"
+                " event_type=%d signal=%u header=%08X size=%08X tid=%lu\n",
+                (unsigned long)i, object,
+                    handles[i], guest_events[i],
+                    guest_events[i] ? event_types[i] : -1,
+                guest_events[i] ? BRIDGE_MEM32(guest_events[i] + 4) : signal,
+                header, size, (unsigned long)thread_id);
         }
     }
 
@@ -5880,11 +6331,22 @@ static void bridge_KeWaitForMultipleObjects(void)
     /* Only a successful wait consumes synchronization events. WaitAny's
      * result selects one member; WaitAll consumes every signalled member. */
     for (i = 0; i < count; i++) {
-        if (guest_events[i] && event_types[i] == 1 &&
-            ((wait_type == 0 && g_eax == 0) ||
-             (wait_type != 0 && g_eax < count && g_eax == i)))
+        int consumed = (wait_type == 0 && g_eax == 0) ||
+                       (wait_type != 0 && g_eax < count && g_eax == i);
+        if (!consumed)
+            continue;
+
+        if (guest_events[i] && event_types[i] == 1) {
             BRIDGE_MEM32(guest_events[i] + 4) = 0;
+        } else {
+            uint32_t object = objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0;
+            if (object && BRIDGE_MEM8(object) == 9 &&
+                BRIDGE_MEM8(object + 2) == 40)
+                BRIDGE_MEM32(object + 4) = 0;
+        }
     }
+    if (trace_objects && trace_object_count <= 64)
+        fprintf(stderr, "[WAITOBJECTS]   result=%08X\n", g_eax);
 }
 
 #undef BRIDGE_MAXIMUM_WAIT_OBJECTS
@@ -7417,9 +7879,8 @@ static void bridge_RtlLeaveCriticalSectionAndRegion(void)
 /* 306: BOOLEAN RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION) */
 static void bridge_RtlTryEnterCriticalSection(void)
 {
-    CRITICAL_SECTION *cs = bridge_try_cs_shadow(STACK_ARG(0));
-    if (!cs) { g_eax = 0; return; }
-    g_eax = TryEnterCriticalSection(cs) ? 1 : 0;
+    g_eax = xbox_RtlTryEnterCriticalSection(
+        (PRTL_CRITICAL_SECTION)XBOX_TO_NATIVE(STACK_ARG(0))) ? 1 : 0;
 }
 
 /* ── Rtl Misc stubs (ordinals 288, 297, 319, 321) ─────────── */
@@ -7502,10 +7963,16 @@ static void bridge_RtlCaptureStackBackTrace(void)
 
 /* --- Ke Object Shadow Table --- */
 #define KE_SHADOW_SIZE 4096
-typedef struct { uint32_t guest_va; HANDLE host_handle; uint32_t in_use; } KE_SHADOW_SLOT;
+typedef struct {
+    uint32_t guest_va;
+    HANDLE host_handle;
+    uint32_t in_use;
+    uint32_t waiters;
+} KE_SHADOW_SLOT;
 static KE_SHADOW_SLOT g_ke_shadow[KE_SHADOW_SIZE];
 static CRITICAL_SECTION g_ke_shadow_cs;
 static int g_ke_shadow_init;
+static volatile LONG g_pending_nv2a_software_interrupt;
 
 static void ke_shadow_init(void)
 {
@@ -7547,6 +8014,7 @@ static void ke_shadow_insert(uint32_t guest_va, HANDLE host)
             g_ke_shadow[i].in_use      = 1;
             g_ke_shadow[i].guest_va    = guest_va;
             g_ke_shadow[i].host_handle = host;
+            g_ke_shadow[i].waiters     = 0;
             LeaveCriticalSection(&g_ke_shadow_cs);
             return;
         }
@@ -7582,6 +8050,40 @@ static HANDLE ke_shadow_lookup(uint32_t guest_va)
     return h;
 }
 
+/* Reverse lookup: host HANDLE -> guest object VA (0 if unknown). */
+static uint32_t ke_shadow_lookup_guest(HANDLE host)
+{
+    uint32_t i;
+    uint32_t guest_va = 0;
+
+    if (!host)
+        return 0;
+
+    ke_shadow_init();
+
+    EnterCriticalSection(&g_ke_shadow_cs);
+    for (i = 0; i < KE_SHADOW_SIZE; i++) {
+        if (g_ke_shadow[i].in_use && g_ke_shadow[i].host_handle == host) {
+            guest_va = g_ke_shadow[i].guest_va;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_ke_shadow_cs);
+    return guest_va;
+}
+
+/* Best-effort token/guest object resolution for trace output.
+ * If token resolves to a host handle that maps back to a shadow object,
+ * return that guest VA; otherwise return 0. */
+static uint32_t trace_resolve_guest_from_token(uint32_t token, HANDLE *out_handle)
+{
+    HANDLE h = bridge_resolve_handle(token);
+    uint32_t guest = h ? ke_shadow_lookup_guest(h) : 0;
+    if (out_handle)
+        *out_handle = h;
+    return guest;
+}
+
 /* Remove (and close) the mapping for a guest object VA. */
 static void ke_shadow_remove(uint32_t guest_va)
 {
@@ -7600,13 +8102,14 @@ static void ke_shadow_remove(uint32_t guest_va)
             g_ke_shadow[i].in_use      = 0;
             g_ke_shadow[i].guest_va    = 0;
             g_ke_shadow[i].host_handle = NULL;
+            g_ke_shadow[i].waiters     = 0;
             break;
         }
     }
     LeaveCriticalSection(&g_ke_shadow_cs);
 }
 
-/* Events a title initialises itself (RECOMP_TITLE_KEVENTS=1, off by default).
+/* Events a title initialises itself (RECOMP_TITLE_KEVENTS controls override).
  *
  * Shadows are made by KeInitializeEvent, but XDK code can build a KEVENT by
  * writing its header directly: one title (T()NY) does not even import
@@ -7622,10 +8125,8 @@ static void ke_shadow_remove(uint32_t guest_va)
  * memory up to date, because XDK code resets it by writing 0 there.
  * Returns NULL for anything else (the old paths apply).
  *
- * Opt-in because it changes what every such wait does: a wait that failed at
- * once now blocks until the event is set, and on a title whose setter the
- * runtime does not model yet (a GPU interrupt, say) that turns a spin into a
- * hang. Turn it on for a title that waits on events it built itself. */
+ * Default is enabled because multiple titles wait on self-built KEVENT headers.
+ * Set RECOMP_TITLE_KEVENTS=0 to force legacy behavior for regression checks. */
 static HANDLE ke_guest_event(uint32_t guest_va, int *type)
 {
     static int enabled = -1;
@@ -7634,7 +8135,7 @@ static HANDLE ke_guest_event(uint32_t guest_va, int *type)
 
     if (enabled < 0) {
         const char *e = getenv("RECOMP_TITLE_KEVENTS");
-        enabled = e && *e == '1';
+        enabled = !(e && *e == '0');
     }
     if (!enabled)
         return NULL;
@@ -7663,6 +8164,11 @@ static HANDLE ke_guest_event(uint32_t guest_va, int *type)
                 g_ke_shadow[i].in_use      = 2;
                 g_ke_shadow[i].guest_va    = guest_va;
                 g_ke_shadow[i].host_handle = h;
+                g_ke_shadow[i].waiters     = 0;
+                if (InterlockedExchange(&g_pending_nv2a_software_interrupt, 0)) {
+                    BRIDGE_MEM32(guest_va + 4) = 1;
+                    SetEvent(h);
+                }
             }
             break;
         }
@@ -7675,6 +8181,60 @@ static HANDLE ke_guest_event(uint32_t guest_va, int *type)
                             "(%s)\n", guest_va, *type ? "synchronization" : "notification");
     }
     return h;
+}
+
+static void ke_guest_event_wait_ref(uint32_t guest_va, int delta)
+{
+    if (!g_ke_shadow_init)
+        return;
+    EnterCriticalSection(&g_ke_shadow_cs);
+    for (uint32_t i = 0; i < KE_SHADOW_SIZE; i++) {
+        KE_SHADOW_SLOT *slot = &g_ke_shadow[i];
+        if (slot->in_use == 2 && slot->guest_va == guest_va) {
+            if (delta > 0)
+                slot->waiters++;
+            else if (slot->waiters)
+                slot->waiters--;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_ke_shadow_cs);
+}
+
+void xbox_Nv2aSignalSoftwareMethod(uint32_t method)
+{
+    static unsigned signal_logs;
+    static int trace_enabled = -1;
+    static unsigned trace_logs;
+
+    if (trace_enabled < 0)
+        trace_enabled = getenv("RECOMP_TRACE_SOFTMETHOD") != NULL;
+    if (trace_enabled && trace_logs++ < 64)
+        fprintf(stderr, "[NV2A-SOFTMETHOD] value=%u (0x%08X) shadow_table=%s\n",
+                method, method, g_ke_shadow_init ? "ready" : "empty");
+
+    if (!method)
+        return;
+    if (!g_ke_shadow_init) {
+        InterlockedExchange(&g_pending_nv2a_software_interrupt, 1);
+        return;
+    }
+    EnterCriticalSection(&g_ke_shadow_cs);
+    int signaled = 0;
+    for (uint32_t i = 0; i < KE_SHADOW_SIZE; i++) {
+        KE_SHADOW_SLOT *slot = &g_ke_shadow[i];
+        if (slot->in_use == 2) {
+            BRIDGE_MEM32(slot->guest_va + 4) = 1;
+            SetEvent(slot->host_handle);
+            signaled++;
+            if (signal_logs++ < 16)
+                fprintf(stderr, "[NV2A-SOFTMETHOD] value=%u signaled guest-event=%08X waiters=%u\n",
+                        method, slot->guest_va, slot->waiters);
+        }
+    }
+    if (!signaled)
+        InterlockedExchange(&g_pending_nv2a_software_interrupt, 1);
+    LeaveCriticalSection(&g_ke_shadow_cs);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -8427,6 +8987,7 @@ static void bridge_KeInitializeSemaphore(void)
 /* --- KePulseEvent (ordinal 123, 3 args = 12 bytes) --- */
 static void bridge_KePulseEvent(void)
 {
+    static int trace_wait = -1;
     uint32_t guest_va = STACK_ARG(0);
     uint32_t increment = STACK_ARG(1);
     uint32_t wait = STACK_ARG(2);
@@ -8435,6 +8996,9 @@ static void bridge_KePulseEvent(void)
     (void)increment;
     (void)wait;
 
+    if (trace_wait < 0)
+        trace_wait = getenv("RECOMP_TRACE_WAIT_RESULTS") != NULL;
+
     {
         int type;
         HANDLE ge = ke_guest_event(guest_va, &type);
@@ -8442,6 +9006,12 @@ static void bridge_KePulseEvent(void)
             PulseEvent(ge);
             BRIDGE_MEM32(guest_va + 4) = 0;
             g_eax = 0;
+            if (trace_wait) {
+                fprintf(stderr,
+                        "[WAITTRACE] tid=%lu api=KePulseEvent guest=%08X handle=%p signal=pulse->0 path=guest-event\n",
+                        GetCurrentThreadId(), guest_va, ge);
+                fflush(stderr);
+            }
             return;
         }
     }
@@ -8450,6 +9020,12 @@ static void bridge_KePulseEvent(void)
         h = XBOX_TO_NATIVE(guest_va);
     if (h)
         PulseEvent(h);
+    if (trace_wait) {
+        fprintf(stderr,
+                "[WAITTRACE] tid=%lu api=KePulseEvent guest=%08X handle=%p signal=pulse path=handle\n",
+                GetCurrentThreadId(), guest_va, h);
+        fflush(stderr);
+    }
 
     g_eax = 0; /* previous state unknown */
 }
@@ -8479,6 +9055,7 @@ static void bridge_KeReleaseMutant(void)
 /* --- KeReleaseSemaphore (ordinal 132, 4 args = 16 bytes) --- */
 static void bridge_KeReleaseSemaphore(void)
 {
+    static int trace_wait = -1;
     uint32_t guest_va = STACK_ARG(0);
     uint32_t increment = STACK_ARG(1);
     uint32_t adjustment = STACK_ARG(2);  /* LONG */
@@ -8488,6 +9065,9 @@ static void bridge_KeReleaseSemaphore(void)
     (void)increment;
     (void)wait;
 
+    if (trace_wait < 0)
+        trace_wait = getenv("RECOMP_TRACE_WAIT_RESULTS") != NULL;
+
     h = ke_shadow_lookup(guest_va);
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
@@ -8495,13 +9075,24 @@ static void bridge_KeReleaseSemaphore(void)
         ReleaseSemaphore(h, (LONG)adjustment, NULL);
 
     g_eax = 0;
+
+    if (trace_wait) {
+        fprintf(stderr,
+                "[WAITTRACE] tid=%lu api=KeReleaseSemaphore guest=%08X handle=%p adj=%ld status=%08X\n",
+                GetCurrentThreadId(), guest_va, h, (long)(LONG)adjustment, g_eax);
+        fflush(stderr);
+    }
 }
 
 /* --- KeResetEvent (ordinal 138, 1 arg = 4 bytes) --- */
 static void bridge_KeResetEvent(void)
 {
+    static int trace_wait = -1;
     uint32_t guest_va = STACK_ARG(0);
     HANDLE h;
+
+    if (trace_wait < 0)
+        trace_wait = getenv("RECOMP_TRACE_WAIT_RESULTS") != NULL;
 
     {
         int type;
@@ -8510,6 +9101,12 @@ static void bridge_KeResetEvent(void)
             BRIDGE_MEM32(guest_va + 4) = 0;
             ResetEvent(ge);
             g_eax = 0;
+            if (trace_wait) {
+                fprintf(stderr,
+                        "[WAITTRACE] tid=%lu api=KeResetEvent guest=%08X handle=%p signal=0 path=guest-event\n",
+                        GetCurrentThreadId(), guest_va, ge);
+                fflush(stderr);
+            }
             return;
         }
     }
@@ -8518,6 +9115,12 @@ static void bridge_KeResetEvent(void)
         h = XBOX_TO_NATIVE(guest_va);
     if (h)
         ResetEvent(h);
+    if (trace_wait) {
+        fprintf(stderr,
+                "[WAITTRACE] tid=%lu api=KeResetEvent guest=%08X handle=%p signal=0 path=handle\n",
+                GetCurrentThreadId(), guest_va, h);
+        fflush(stderr);
+    }
 
     g_eax = 0;
 }
@@ -9241,7 +9844,8 @@ static void bridge_PsCreateSystemThread(void)
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
                     bridge_spawn_guest_thread(fn, start_context1, start_context2,
-                                              stack_top, xbox_handle_ptr, 0);
+                                              stack_top, xbox_handle_ptr, 0,
+                                              start_routine);
                 }
             }
         } else {
@@ -10823,21 +11427,19 @@ static void kernel_thunk_dispatch_body(void)
     ordinal = g_slot_ordinals[slot];
     bridge = g_slot_bridges[slot];
 
+
     g_kernel_call_count++;
     if (ordinal < XBOX_KERNEL_THUNK_TABLE_SIZE)
         g_ordinal_calls[ordinal]++;
 
     if (KERNEL_LOG_ON()) {
-        /* The guest return address sits at the top of the guest stack: the
-         * caller pushed it before dispatching here. Logging it turns "some
-         * function is calling this" into "this call site is", which is the
-         * difference between guessing and knowing when a title recurses. */
+        uint32_t _ret = g_esp ? BRIDGE_MEM32(g_esp) : 0;
         fprintf(stderr,
                 "  [KERNEL] #%lld: ordinal %u (slot %d) esp=0x%08X ret=0x%08X\n",
-                g_kernel_call_count, ordinal, slot, g_esp,
-                g_esp ? BRIDGE_MEM32(g_esp) : 0);
+                g_kernel_call_count, ordinal, slot, g_esp, _ret);
         fflush(stderr);
     }
+
 
     {
         static DWORD last_summary_tick = 0;
@@ -11150,30 +11752,55 @@ void xbox_kernel_bridge_init(void)
         VirtualProtect((LPVOID)((uintptr_t)low + g_xbox_mem_offset),
                        LOOKBEHIND * 4, PAGE_READWRITE, &scan_protect);
 
-        for (i = 1; i <= LOOKBEHIND; i++) {
-            uint32_t va = g_thunk_table_base - i * 4;
-            uint32_t current = BRIDGE_MEM32(va);
-            int slot;
+        {
+            int saw_marker = 0;
+            for (i = 1; i <= LOOKBEHIND; i++) {
+                uint32_t va = g_thunk_table_base - i * 4;
+                uint32_t current = BRIDGE_MEM32(va);
+                uint32_t data_va;
+                int slot;
+                int _n;
 
-            if (!(current & 0x80000000)) {
-                continue;            /* NULL separator or ordinary data */
+                if (!(current & 0x80000000)) {
+                    if (saw_marker)
+                        break;       /* end of adjacent ordinal run */
+                    continue;        /* leading NULL/data before the run */
+                }
+                saw_marker = 1;
+
+                slot = g_thunk_table_count + i;   /* park these above the main run */
+                if (slot >= XBOX_KERNEL_THUNK_TABLE_SIZE) {
+                    break;
+                }
+
+                g_slot_ordinals[slot] = current & 0x7FFFFFFF;
+                if (getenv("RECOMP_TRACE_THUNK_SCAN")) {
+                    fprintf(stderr,
+                            "  [KERNEL] lookbehind thunk candidate va=0x%08X raw=0x%08X ordinal=%u slot=%d\n",
+                            va, current, g_slot_ordinals[slot], slot);
+                }
+
+                data_va = kernel_data_va_for_ordinal(g_slot_ordinals[slot]);
+                g_slot_bridges[slot] = bridge_for_ordinal(g_slot_ordinals[slot]);
+                _n = stdcall_args_for_ordinal(g_slot_ordinals[slot]);
+                if (!data_va && !g_slot_bridges[slot] && _n < 0) {
+                    if (getenv("RECOMP_TRACE_THUNK_SCAN")) {
+                        fprintf(stderr,
+                                "  [KERNEL] lookbehind thunk rejected va=0x%08X raw=0x%08X ordinal=%u\n",
+                                va, current, g_slot_ordinals[slot]);
+                    }
+                    break;
+                }
+
+                g_slot_arg_unknown[slot] = (uint8_t)(_n < 0);
+                g_slot_arg_bytes[slot] = (_n < 0) ? 0 : _n;
+                BRIDGE_MEM32(va) = data_va ? data_va : (KERNEL_VA_BASE + slot * 4);
+                resolved++;
+                if (g_slot_bridges[slot] || data_va) bridged++; else unbridged++;
+
+                fprintf(stderr, "  [KERNEL] extra thunk at 0x%08X: ordinal %u (slot %d)\n",
+                        va, g_slot_ordinals[slot], slot);
             }
-            slot = g_thunk_table_count + i;   /* park these above the main run */
-            if (slot >= XBOX_KERNEL_THUNK_TABLE_SIZE) {
-                break;
-            }
-
-            g_slot_ordinals[slot] = current & 0x7FFFFFFF;
-            g_slot_bridges[slot] = bridge_for_ordinal(g_slot_ordinals[slot]);
-            { int _n = stdcall_args_for_ordinal(g_slot_ordinals[slot]);
-              g_slot_arg_unknown[slot] = (uint8_t)(_n < 0);
-              g_slot_arg_bytes[slot] = (_n < 0) ? 0 : _n; }
-            BRIDGE_MEM32(va) = KERNEL_VA_BASE + slot * 4;
-            resolved++;
-            if (g_slot_bridges[slot]) bridged++; else unbridged++;
-
-            fprintf(stderr, "  [KERNEL] extra thunk at 0x%08X: ordinal %u (slot %d)\n",
-                    va, g_slot_ordinals[slot], slot);
         }
 
         VirtualProtect((LPVOID)((uintptr_t)low + g_xbox_mem_offset),
