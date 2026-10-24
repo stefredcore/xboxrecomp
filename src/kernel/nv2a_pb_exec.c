@@ -768,14 +768,17 @@ static int trace_tex_hit(void)
         const char *mx = getenv("RECOMP_TRACE_TEX_MAX");
         left = mx ? atoi(mx) : (all ? 1000 : 16);
     }
+    /* Before anything else: this runs for every triangle, and the getenv
+     * below scanned the environment each time even with the trace off -- in
+     * Driving it was a third of the NV2A thread. */
+    if (!on)
+        return 0;
     {
         static DWORD t0;
         static uint32_t seen[1024][4];
         static int nseen;
         const char *after = getenv("RECOMP_TRACE_TEX_AFTER_MS");
         int st, hit = 0;
-        if (!on)
-            return 0;
         if (!t0)
             t0 = GetTickCount();
         if (after && GetTickCount() - t0 < (DWORD)strtoul(after, NULL, 0))
