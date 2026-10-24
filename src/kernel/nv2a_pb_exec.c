@@ -3127,6 +3127,26 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
         memcpy(p0, p1, sizeof p1);
     if (n < 3) {
         s_gpu.tris_behind++;                  /* wholly clipped away */
+        /* RECOMP_TRACE_NEARCLIP: a triangle dropped whole, with the depth
+         * range it was clipped against and its vertices' screen z and w --
+         * at most one every two seconds, 200 in all. For "a whole scene is
+         * dropped behind the eye". */
+        {
+            static int trace = -1;
+            static DWORD last;
+            static int logged;
+            if (trace < 0)
+                trace = getenv("RECOMP_TRACE_NEARCLIP") != NULL;
+            if (trace && logged < 200 && GetTickCount() - last >= 2000) {
+                last = GetTickCount();
+                logged++;
+                fprintf(stderr, "  [NEARCLIP] draw %u %s: clip_min %g clip_max %g near %g  "
+                                "z %g %g %g  w %g %g %g\n",
+                        s_gpu.draws, batch_uses_program() ? "program" : "ffp",
+                        reg_f(0x0394), reg_f(0x0398), s_xf_o[2],
+                        a->pos[2], b->pos[2], c->pos[2], a->pos[3], b->pos[3], c->pos[3]);
+            }
+        }
         return;
     }
     /* Back to screen space: divide by the (now positive) w. */
@@ -3297,8 +3317,17 @@ static void xf_set_viewport(void)
      * [clip_min, clip_max] too), not the viewport's z offset. D3D sets both
      * to the same value, but a program that passes screen-space vertices
      * straight through ignores the offset: Nightfire's driving text sits at
-     * z = 0 with clip_min 0, and clipping at the offset dropped every glyph. */
-    s_xf_o[2] = reg_f(0x0394);
+     * z = 0 with clip_min 0, and clipping at the offset dropped every glyph.
+     *
+     * A degenerate range is no near plane: Nightfire's main game draws its
+     * whole world with SET_CLIP_MIN = SET_CLIP_MAX = 16777215 and the scene at
+     * z 16774000..16776500, just below it. Clipped at clip_min, every world
+     * triangle was dropped "behind the eye" and the levels were black under
+     * the HUD; on the console (and in xemu) they draw. With max not above
+     * min the near plane is z = 0, and what lies behind the eye still goes
+     * at the w plane. A proper range -- the driving missions' 0..16777215 --
+     * clips at clip_min as before. */
+    s_xf_o[2] = reg_f(0x0398) > reg_f(0x0394) ? reg_f(0x0394) : 0.0f;
 }
 
 static void raster_batch_program(void)
