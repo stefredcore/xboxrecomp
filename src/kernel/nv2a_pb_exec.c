@@ -314,7 +314,7 @@ static struct {
     uint32_t clip_raw_h, clip_raw_v;    /* SET_SURFACE_CLIP_* as sent: logical */
     float    aa_sx, aa_sy;              /* anti-aliasing scale of the surface */
     uint32_t clear_color;
-    uint32_t clears, unhandled_total;
+    uint32_t clears, clears_z, unhandled_total;
     uint32_t flip_read, flip_write, flip_modulo, flips;
     uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
     /* Why a batch came out flat. "Untextured" has two causes that look
@@ -345,6 +345,7 @@ static struct {
     uint32_t batches_program, verts_program, tris_behind;
     /* Where program-path triangles go, so "nothing drew" has a reason. */
     uint32_t xf_degenerate, xf_offscreen, xf_drawn;
+    uint32_t tris_culled;               /* back faces dropped (SET_CULL_FACE) */
     uint64_t xf_depth_fail, xf_pixels;
     float xf_min[3], xf_max[3];
     uint32_t xf_fmt[16];  /* attribute formats seen: type | size<<4 | slot<<8 */
@@ -1042,6 +1043,8 @@ static void clear_surface(uint32_t param)
     uint32_t bpp = surface_bpp();
     uint32_t y, x;
 
+    if (param & 0x1)
+        s_gpu.clears_z++;
     /* A back end clears colour and/or depth/stencil itself (flags are the
      * CLEAR_SURFACE bits: Z 0x1, stencil 0x2, colour 0xF0). */
     if (s_backend && s_backend->clear) {
@@ -2861,6 +2864,8 @@ static void xf_queue_push(const XfTri *T)
     s_xfq_px += (long)(T->maxx - T->minx) * (T->maxy - T->miny);
 }
 
+static int batch_uses_program(void);
+
 static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                                const Nv2aVshOutput *vc)
 {
@@ -2906,6 +2911,31 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     if (area == 0.0f || area != area) {
         s_gpu.xf_degenerate++;
         return;
+    }
+    /* Back-face culling, from the projected positions as the hardware decides
+     * it (after the near-plane clip, so a triangle reaching behind the eye is
+     * judged by the part that is drawn). Without it every face a title culls
+     * is drawn, and a closed body the camera gets inside of covers the screen
+     * with its inside faces' depth.
+     * area > 0 is clockwise on the screen (y down). Opt-in until the winding
+     * is confirmed on a title: RECOMP_CULL=1 turns it on, RECOMP_CULL_FLIP=1
+     * as well reverses which winding is the front. */
+    {
+        static int mode = -1;
+        if (mode < 0) {
+            const char *e = getenv("RECOMP_CULL"), *f = getenv("RECOMP_CULL_FLIP");
+            mode = !(e && e[0] == '1') ? 0 : (f && f[0] == '1') ? 2 : 1;
+        }
+        if (mode && s_reg[0x0308 / 4]) {               /* SET_CULL_FACE_ENABLE */
+            uint32_t face = s_reg[0x039C / 4];          /* SET_CULL_FACE */
+            uint32_t ff = s_reg[0x03A0 / 4];            /* SET_FRONT_FACE */
+            int cw = (area > 0.0f) != (mode == 2);
+            int front = ff == 0x0901 ? !cw : cw;        /* GL_CCW 0x901, GL_CW 0x900 */
+            if (face == 0x0408 || (face == 0x0404 && front) || (face == 0x0405 && !front)) {
+                s_gpu.tris_culled++;
+                return;
+            }
+        }
     }
     if (backend_draws()) {                     /* a back end rasterises */
         Nv2aVertex *o = backend_slot();
@@ -3158,6 +3188,105 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
     return 1;
 }
 
+/* With RECOMP_FB_PRESENT_DUMP: what each transformed draw of the frame wrote,
+ * kept for this frame and the one before. A frame whose depth-test failures
+ * jump far above the running average is printed against the previous frame,
+ * draws ranked by pixels written -- the extra draw, or the draw that grew,
+ * is what covered the scene. */
+typedef struct {
+    uint32_t draw, tris, verts, prog, tex0;
+    uint64_t px, df;
+    float    v0[4];                     /* first vertex, screen x/y/z and w */
+} DrawStat;
+#define DRAW_STAT_MAX 2048
+static DrawStat s_dstat[2][DRAW_STAT_MAX];
+static int s_dstat_n[2], s_dstat_cur;
+static uint64_t s_dstat_px0, s_dstat_df0;
+static uint32_t s_dstat_t0;
+
+static int draw_stat_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_FB_PRESENT_DUMP") != NULL;
+    return on;
+}
+
+static void draw_stat_note(void)
+{
+    DrawStat *d;
+    if (!draw_stat_on())
+        return;
+    if (s_dstat_n[s_dstat_cur] < DRAW_STAT_MAX) {
+        d = &s_dstat[s_dstat_cur][s_dstat_n[s_dstat_cur]++];
+        d->draw = s_gpu.draws;
+        d->tris = s_gpu.tris_drawn - s_dstat_t0;
+        d->verts = s_gpu.idx_count;
+        d->prog = (uint32_t)batch_uses_program();
+        d->tex0 = s_gpu.texs[0].valid ? s_gpu.texs[0].offset : 0;
+        d->px = s_gpu.xf_pixels - s_dstat_px0;
+        d->df = s_gpu.xf_depth_fail - s_dstat_df0;
+        if (s_xf)
+            memcpy(d->v0, s_xf[0].pos, sizeof d->v0);
+        else
+            memset(d->v0, 0, sizeof d->v0);
+    }
+    s_dstat_px0 = s_gpu.xf_pixels;
+    s_dstat_df0 = s_gpu.xf_depth_fail;
+    s_dstat_t0 = s_gpu.tris_drawn;
+}
+
+static int draw_stat_by_px(const void *a, const void *b)
+{
+    uint64_t x = ((const DrawStat *)a)->px, y = ((const DrawStat *)b)->px;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+/* At the flip: compare, report a bad frame, start the next. frame_df is the
+ * frame's depth-test failures. */
+static void draw_stat_flip(uint64_t frame_df)
+{
+    static double avg;
+    int cur = s_dstat_cur, prev = cur ^ 1, i, k;
+
+    if (!draw_stat_on())
+        return;
+    if (avg > 0.0 && frame_df > 2.5 * avg && frame_df > 1000000ull) {
+        static DrawStat top[2][12];
+        int nt[2];
+        for (k = 0; k < 2; k++) {
+            int f = k ? prev : cur, n = s_dstat_n[f];
+            DrawStat *tmp = (DrawStat *)malloc((size_t)n * sizeof *tmp);
+            nt[k] = 0;
+            if (!tmp)
+                continue;
+            memcpy(tmp, s_dstat[f], (size_t)n * sizeof *tmp);
+            qsort(tmp, n, sizeof *tmp, draw_stat_by_px);
+            nt[k] = n < 12 ? n : 12;
+            memcpy(top[k], tmp, (size_t)nt[k] * sizeof *tmp);
+            free(tmp);
+        }
+        fprintf(stderr, "  [BADFRAME] depth-failed %llu (average %.0f); %d draws, previous frame %d. "
+                        "Top draws by pixels written, this frame / previous:\n",
+                (unsigned long long)frame_df, avg, s_dstat_n[cur], s_dstat_n[prev]);
+        for (i = 0; i < 12; i++) {
+            for (k = 0; k < 2; k++) {
+                if (i < nt[k]) {
+                    const DrawStat *d = &top[k][i];
+                    fprintf(stderr, "  [BADFRAME] %s #%-5u %s tex %08X %5u verts %5u tris px %8llu "
+                                    "df %8llu v0 (%.0f,%.0f,%.3g w%.3g)\n",
+                            k ? "prev" : "this", d->draw, d->prog ? "prog" : "ffp ", d->tex0,
+                            d->verts, d->tris, (unsigned long long)d->px,
+                            (unsigned long long)d->df, d->v0[0], d->v0[1], d->v0[2], d->v0[3]);
+                }
+            }
+        }
+    }
+    avg = avg > 0.0 ? avg * 0.9 + (double)frame_df * 0.1 : (double)frame_df;
+    s_dstat_cur = prev;
+    s_dstat_n[prev] = 0;
+}
+
 static void xf_set_viewport(void)
 {
     const float *of = nv2a_vsh_constant(59);
@@ -3310,6 +3439,7 @@ static void raster_batch_program(void)
     }
     /* The batch's triangles, all at once (see xf_queue_push). */
     xf_queue_flush();
+    draw_stat_note();
     if (backend_draws())
         backend_flush(!s_xf_no_tex);
 }
@@ -4393,6 +4523,35 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             static uint32_t draws_at_flip;
             xbox_FramebufferWindowFrameStats(s_gpu.draws - draws_at_flip);
             draws_at_flip = s_gpu.draws;
+        }
+        /* With RECOMP_FB_PRESENT_DUMP, what this frame did, printed before the
+         * window's [FBDUMP] line for the same flip: a frame that comes out
+         * wrong can be read against the ones either side of it. */
+        {
+            static int on = -1;
+            static uint32_t d0, c0, z0, t0, b0, g0, o0, u0, cu0;
+            static uint64_t px0, df0;
+            if (on < 0)
+                on = getenv("RECOMP_FB_PRESENT_DUMP") != NULL;
+            if (on) {
+                fprintf(stderr, "  [FLIPSTAT] draws %u clears %u (z %u) tris %u behind %u "
+                                "degenerate %u offscreen %u untransformed %u culled %u "
+                                "pixels %llu depth-failed %llu  clip %g..%g zclear %08X\n",
+                        s_gpu.draws - d0, s_gpu.clears - c0, s_gpu.clears_z - z0,
+                        s_gpu.tris_drawn - t0, s_gpu.tris_behind - b0,
+                        s_gpu.xf_degenerate - g0, s_gpu.xf_offscreen - o0,
+                        s_gpu.batches_untransformed - u0, s_gpu.tris_culled - cu0,
+                        (unsigned long long)(s_gpu.xf_pixels - px0),
+                        (unsigned long long)(s_gpu.xf_depth_fail - df0),
+                        reg_f(0x0394), reg_f(0x0398), s_gpu.zstencil_clear);
+                draw_stat_flip(s_gpu.xf_depth_fail - df0);
+                px0 = s_gpu.xf_pixels; df0 = s_gpu.xf_depth_fail;
+                d0 = s_gpu.draws; c0 = s_gpu.clears; z0 = s_gpu.clears_z;
+                t0 = s_gpu.tris_drawn; b0 = s_gpu.tris_behind;
+                g0 = s_gpu.xf_degenerate; o0 = s_gpu.xf_offscreen;
+                u0 = s_gpu.batches_untransformed;
+                cu0 = s_gpu.tris_culled;
+            }
         }
         /* A back end that renders off the CPU writes its surfaces back to
          * guest memory here, so the copy the window takes below is the frame

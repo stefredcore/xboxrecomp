@@ -3560,9 +3560,28 @@ static void kernel_vblank_raise(void)
  * edge, 0 when vblanks are off. */
 #define VBLANK_RESTART_NS 100000000ull
 
+/* The display rate the title runs against: 50 Hz on a PAL console
+ * (RECOMP_CONSOLE_REGION=pal), 60 Hz otherwise. A PAL title paced on vblanks
+ * runs at its original speed only at 50. RECOMP_VBLANK_HZ overrides either
+ * (e.g. 60 for a PAL title on a 60 Hz monitor, once its timing allows). */
+static uint32_t vblank_hz(void)
+{
+    static uint32_t hz;
+    if (!hz) {
+        const char *e = getenv("RECOMP_VBLANK_HZ");
+        const char *r = getenv("RECOMP_CONSOLE_REGION");
+        uint32_t v = e ? (uint32_t)strtoul(e, NULL, 0) : 0;
+        if (v < 20 || v > 240)
+            v = (r && (r[0] == 'p' || r[0] == 'P')) ? 50u : 60u;
+        hz = v;
+        fprintf(stderr, "  [VBLANK] %u Hz\n", hz);
+    }
+    return hz;
+}
+
 static uint64_t vblank_due(uint64_t t0_ns, uint64_t n)
 {
-    return t0_ns + n * 1000000000ull / 60u;
+    return t0_ns + n * 1000000000ull / vblank_hz();
 }
 
 static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)

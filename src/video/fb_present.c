@@ -205,6 +205,79 @@ void xbox_FramebufferWindowSetAA(uint32_t sy)
     s_fb_aa_sy = sy ? sy : 1;
 }
 
+/* Draws in the frame just flipped (xbox_FramebufferWindowFrameStats). */
+static volatile LONG s_frame_draws;
+
+/* RECOMP_FB_PRESENT_DUMP=<skip>,<count>: after <skip> flips, every presented
+ * frame of the next <count> goes to logs\flicker\ as a BMP named after the
+ * flip and the buffer it came from. Flicker is one bad frame among good ones;
+ * this is the sequence a person saw, one file per flip, to find it in. Only
+ * frames of 50 draws or more are counted, so a loading screen of unknown
+ * length does not use up the window before the scene starts; a third value,
+ * <skip>,<count>,<min draws>, changes that (1 for a menu). */
+static void present_dump(const uint32_t *img, uint32_t fb_va, uint32_t pitch)
+{
+    static int init;
+    static unsigned skip, count, flips, min_draws = 50;
+    static char exe[64] = "title";
+    char path[200];
+    uint8_t hdr[54];
+    uint32_t row = s_fb_width * 3, pad = (4 - (row & 3)) & 3;
+    uint32_t size = 54 + (row + pad) * s_fb_height, x, y;
+    uint8_t *line;
+    FILE *f;
+
+    if (!init) {
+        const char *e = getenv("RECOMP_FB_PRESENT_DUMP");
+        init = 1;
+        if (e) {
+            char full[MAX_PATH], *base, *dot;
+            skip = (unsigned)strtoul(e, (char **)&e, 0);
+            count = *e == ',' ? (unsigned)strtoul(e + 1, (char **)&e, 0) : 100u;
+            if (*e == ',')                       /* optional third: min draws */
+                min_draws = (unsigned)strtoul(e + 1, NULL, 0);
+            CreateDirectoryA("logs", NULL);
+            CreateDirectoryA("logs\\flicker", NULL);
+            /* Each executable counts its own flips: name the files after it. */
+            if (GetModuleFileNameA(NULL, full, sizeof full)) {
+                base = strrchr(full, '\\');
+                base = base ? base + 1 : full;
+                if ((dot = strrchr(base, '.')) != NULL)
+                    *dot = 0;
+                snprintf(exe, sizeof exe, "%s", base);
+            }
+        }
+    }
+    if (!count || (unsigned)s_frame_draws < min_draws || flips++ < skip || flips > skip + count)
+        return;
+    snprintf(path, sizeof path, "logs\\flicker\\%s_%05u_%08X.bmp", exe, flips, fb_va);
+    f = fopen(path, "wb");
+    if (!f)
+        return;
+    memset(hdr, 0, sizeof hdr);
+    hdr[0] = 'B'; hdr[1] = 'M';
+    memcpy(hdr + 2, &size, 4);
+    hdr[10] = 54; hdr[14] = 40;
+    memcpy(hdr + 18, &s_fb_width, 4);
+    memcpy(hdr + 22, &s_fb_height, 4);
+    hdr[26] = 1; hdr[28] = 24;
+    fwrite(hdr, 1, 54, f);
+    line = (uint8_t *)calloc(1, row + pad);
+    for (y = s_fb_height; y-- > 0;) {
+        for (x = 0; x < s_fb_width && line; x++) {
+            uint32_t p = img[(size_t)y * s_fb_width + x];
+            line[x * 3 + 0] = (uint8_t)p;
+            line[x * 3 + 1] = (uint8_t)(p >> 8);
+            line[x * 3 + 2] = (uint8_t)(p >> 16);
+        }
+        if (line)
+            fwrite(line, 1, row + pad, f);
+    }
+    free(line);
+    fclose(f);
+    fprintf(stderr, "  [FBDUMP] flip %u: buffer %08X pitch %u -> %s\n", flips, fb_va, pitch, path);
+}
+
 /* Called by the pushbuffer executor when the title flips. */
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
 {
@@ -263,6 +336,7 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
             memset(dst, 0, (size_t)s_fb_width * 4);
         }
     }
+    present_dump(s_present[next], fb_va, pitch);
     /* Published only once it is whole. */
     InterlockedExchange(&s_present_idx, next);
 }
@@ -272,7 +346,6 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
  * number for a second, which nobody can tell apart from a real one. */
 static wchar_t       s_title[48] = L"Xbox Recomp";
 static volatile LONG s_flips;
-static volatile LONG s_frame_draws;
 
 void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars)
 {
