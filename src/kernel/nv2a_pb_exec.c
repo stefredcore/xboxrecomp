@@ -2216,7 +2216,10 @@ static void backend_texture(const Texture *t, Nv2aTexture *o)
     o->color   = t->color;
     o->addr_u  = t->addr_u;
     o->addr_v  = t->addr_v;
-    o->levels  = t->pitch ? 1 : t->levels;
+    /* By the format, not the pitch: the pitch register keeps whatever the
+     * last linear texture set, which took the mip chain from every swizzled
+     * texture drawn after one. */
+    o->levels  = tex_size_from_format(t->color) ? t->levels : 1;
     o->filter  = t->filter;
     o->palette = t->palette;
     o->cube    = (uint32_t)t->cube;
