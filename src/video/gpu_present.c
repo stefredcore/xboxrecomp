@@ -12,7 +12,7 @@
  * Opt-in with RECOMP_D3D_PRESENT=1; anything that fails falls back to GDI.
  * Linear filtering, RECOMP_PRESENT_FILTER=point for sharp pixels;
  * RECOMP_PRESENT_VSYNC=0 presents without waiting for the display, as the
- * SDL window does.
+ * SDL window does. One frame is queued at most (RECOMP_PRESENT_LATENCY).
  */
 #if defined(_WIN32)
 #define COBJMACROS
@@ -132,6 +132,21 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
         if (SUCCEEDED(IDXGISwapChain_GetParent(s_chain, &IID_IDXGIFactory, (void **)&fac))) {
             IDXGIFactory_MakeWindowAssociation(fac, hwnd, DXGI_MWA_NO_ALT_ENTER);
             IDXGIFactory_Release(fac);
+        }
+    }
+    {
+        /* One frame in flight, not DXGI's default of three. Nothing but
+         * Present paces the window thread, so it kept that queue full and
+         * every frame waited up to three refreshes before it was scanned out:
+         * ~50 ms of input lag at 60 Hz that the console never had.
+         * RECOMP_PRESENT_LATENCY=<n> sets another depth (1-16). */
+        const char *l = getenv("RECOMP_PRESENT_LATENCY");
+        UINT depth = l ? (UINT)atoi(l) : 1u;
+        IDXGIDevice1 *d1 = NULL;
+        if (depth >= 1 && depth <= 16
+            && SUCCEEDED(ID3D11Device_QueryInterface(s_dev, &IID_IDXGIDevice1, (void **)&d1))) {
+            IDXGIDevice1_SetMaximumFrameLatency(d1, depth);
+            IDXGIDevice1_Release(d1);
         }
     }
     ZeroMemory(&td, sizeof td);
