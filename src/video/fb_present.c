@@ -205,6 +205,45 @@ void xbox_FramebufferWindowSetAA(uint32_t sy)
     s_fb_aa_sy = sy ? sy : 1;
 }
 
+/* One shown row of a 2x-wide anti-aliased 32-bit surface. The console's
+ * scan-out filters the 2x1 (or 2x2, s_fb_aa_sy 2) samples behind each pixel
+ * into one; taking every other sample instead showed the aliasing the title
+ * paid twice the fill rate to remove. Averaged per channel, rounded.
+ * RECOMP_FB_AA_RESOLVE=0 takes every other sample, as before. */
+static void aa_resolve_row(uint32_t *dst, const uint8_t *row, uint32_t pitch,
+                           uint32_t width)
+{
+    static int on = -1;
+    const uint32_t m = 0x00FF00FFu;
+    const uint32_t *p = (const uint32_t *)row;
+    const uint32_t *q = (const uint32_t *)(row + pitch);
+    uint32_t x;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_FB_AA_RESOLVE");
+        on = !(e && e[0] == '0');
+    }
+    if (!on) {
+        for (x = 0; x < width; x++)
+            dst[x] = p[x * 2];
+    } else if (s_fb_aa_sy == 2) {
+        for (x = 0; x < width; x++) {
+            uint32_t a = p[x * 2], b = p[x * 2 + 1], c = q[x * 2], d = q[x * 2 + 1];
+            uint32_t lo = ((a & m) + (b & m) + (c & m) + (d & m) + 0x00020002u) >> 2;
+            uint32_t hi = (((a >> 8) & m) + ((b >> 8) & m) + ((c >> 8) & m)
+                           + ((d >> 8) & m) + 0x00020002u) >> 2;
+            dst[x] = (lo & m) | ((hi & m) << 8);
+        }
+    } else {
+        for (x = 0; x < width; x++) {
+            uint32_t a = p[x * 2], b = p[x * 2 + 1];
+            uint32_t lo = ((a & m) + (b & m) + 0x00010001u) >> 1;
+            uint32_t hi = (((a >> 8) & m) + ((b >> 8) & m) + 0x00010001u) >> 1;
+            dst[x] = (lo & m) | ((hi & m) << 8);
+        }
+    }
+}
+
 /* Draws in the frame just flipped (xbox_FramebufferWindowFrameStats). */
 static volatile LONG s_frame_draws;
 
@@ -339,11 +378,8 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
         if (bpp == 4) {
             memcpy(dst, row, (size_t)s_fb_width * 4);
         } else if (bpp == 8) {
-            /* 2x-wide anti-aliased 32-bit surface: every other pixel, as in
-             * fb_convert. */
-            const uint32_t *p = (const uint32_t *)row;
-            for (x = 0; x < s_fb_width; x++)
-                dst[x] = p[x * 2];
+            /* 2x-wide anti-aliased 32-bit surface, as in fb_convert. */
+            aa_resolve_row(dst, row, pitch, s_fb_width);
         } else if (bpp == 2) {
             const uint16_t *p = (const uint16_t *)row;
             for (x = 0; x < s_fb_width; x++) {
@@ -533,13 +569,11 @@ static void fb_convert(const uint8_t *src, uint32_t bpp)
         if (bpp == 4) {
             memcpy(dst, row, (size_t)s_fb_width * 4);
         } else if (bpp == 8) {
-            /* A 2x-wide anti-aliased 32-bit surface (pitch = 2 * width * 4):
-             * take every other pixel. X-Men Legends renders its 640-wide
-             * frame into a 1280-wide surface, which read as "8 bytes per
-             * pixel" and showed black. */
-            const uint32_t *p = (const uint32_t *)row;
-            for (x = 0; x < s_fb_width; x++)
-                dst[x] = p[x * 2];
+            /* A 2x-wide anti-aliased 32-bit surface (pitch = 2 * width * 4),
+             * filtered down (aa_resolve_row). X-Men Legends renders its
+             * 640-wide frame into a 1280-wide surface, which read as "8
+             * bytes per pixel" and showed black. */
+            aa_resolve_row(dst, row, s_fb_pitch, s_fb_width);
         } else if (bpp == 2) {
             const uint16_t *p = (const uint16_t *)row;
             for (x = 0; x < s_fb_width; x++) {
