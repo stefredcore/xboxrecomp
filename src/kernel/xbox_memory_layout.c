@@ -1403,6 +1403,8 @@ static void framebuffer_probe_tick(void)
  * next kickoff for the whole hold, where the console lets it build the next
  * frame meanwhile: Nightfire's driving missions lost a third of their frames
  * to it, and its menus stay at 50 without it. */
+static volatile LONG g_nv2a_flip_held;   /* the ack loop's last poll */
+
 static int flip_hold_pfb(void)
 {
     static int on = -1;
@@ -1469,13 +1471,12 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * locked while it waits; the release depends only on the vblank
          * count and the clock.
          *
-         * The hold is per submitted segment: the walk that arms it finishes
-         * its segment and sets GET to PUT, and the next segment waits. A
-         * D3D present kicks off right after its stall, so the stall ends
-         * its segment and the two are the same; a segment carrying two
-         * flips paces only the last. */
+         * The walk stops at the held FLIP_STALL itself (nv2a_pb_walk_stopped)
+         * and carries on from there once the hold is released, so a segment
+         * carrying two flips paces each of them. */
         extern int nv2a_pb_exec_flip_poll(void);
         int flip_held = nv2a_pb_exec_flip_poll();
+        g_nv2a_flip_held = flip_held;
         nv2a_ack_busy_bits(flip_held);
         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
             volatile uint32_t *r =
@@ -1525,8 +1526,10 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             static uint32_t get_written = 0xFFFFFFFFu;  /* GET as we last left it */
             DWORD now_ms = GetTickCount();
             uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+            extern int nv2a_pb_walk_stopped(void);
+            int resume = nv2a_pb_walk_stopped();   /* stopped at a held flip */
             if (!flip_held
-                    && (put != last_put || (now_ms - last_put_ms) > 2000)) {
+                    && (put != last_put || resume || (now_ms - last_put_ms) > 2000)) {
                 /* Survey the segment the title just submitted, once. */
                 {
                     extern void nv2a_pb_scan(uint32_t);
@@ -1562,7 +1565,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                          * before it. */
                         if (get_written == 0xFFFFFFFFu || get_now != get_written)
                             nv2a_pb_resync(get_now);
-                        if (put != last_put)
+                        if (put != last_put || resume)
                             nv2a_pb_scan(put);
                     } else {
                         /* The segment scan, the default: the bytes between
@@ -1678,6 +1681,40 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
     return 0;
 }
 
+/* The PFB flush XDK D3D's KickOff waits on (0x100410 bit 16), answered at
+ * once. On the console the write-combine flush takes microseconds; answered
+ * only by the walker, every 256 commands, the title waited at each kickoff for
+ * the GPU thread to get through whatever draw it was transforming, and spent
+ * 60% of its time in that spin in the driving missions -- the CPU and the GPU
+ * took turns instead of working side by side. This thread watches the bit
+ * while kickoffs come and sleeps after XBOX_PFB_IDLE_US without one.
+ * RECOMP_PFB_ACK_THREAD=0 leaves the bit to the walker as before. */
+#define XBOX_PFB_IDLE_US 2000
+
+static DWORD WINAPI nv2a_pfb_thread(LPVOID param)
+{
+    volatile LONG *r = (volatile LONG *)((char *)param + NV2A_ACK_PFB_FLUSH);
+    LARGE_INTEGER f, last, now;
+    unsigned n = 0;
+
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&last);
+    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        if ((*r & 0x10000) && !(g_nv2a_flip_held && flip_hold_pfb())) {
+            InterlockedAnd(r, ~0x10000);
+            QueryPerformanceCounter(&last);
+            continue;
+        }
+        YieldProcessor();
+        if ((++n & 255) == 0) {
+            QueryPerformanceCounter(&now);
+            if ((now.QuadPart - last.QuadPart) * 1000000 > f.QuadPart * XBOX_PFB_IDLE_US)
+                Sleep(1);
+        }
+    }
+    return 0;
+}
+
 static void xbox_Nv2aAckStart(void)
 {
     dsp_ack_init();
@@ -1685,6 +1722,11 @@ static void xbox_Nv2aAckStart(void)
     g_nv2a_ack_stop = 0;
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
+    {
+        const char *e = getenv("RECOMP_PFB_ACK_THREAD");
+        if (!(e && *e == '0'))
+            CloseHandle(CreateThread(NULL, 0, nv2a_pfb_thread, g_nv2a_memory, 0, NULL));
+    }
     if (g_nv2a_ack_thread) {
         fprintf(stderr, "  NV2A busy-bit ack: %zu register(s) acknowledged\n",
                 sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]));

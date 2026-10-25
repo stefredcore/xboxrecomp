@@ -1199,6 +1199,7 @@ VOID __stdcall xbox_KeBugCheck(ULONG BugCheckCode)
     /* ExitProcess skips atexit. Guest code calls this, never from inside
      * the report's lock, so the summary's list write may take it. */
     xbox_missing_summary("bugcheck");
+    fflush(stderr);   /* stderr is buffered by some hosts */
     ExitProcess(BugCheckCode);
 }
 
@@ -1221,6 +1222,7 @@ VOID __stdcall xbox_KeBugCheckEx(
     /* ExitProcess skips atexit. Guest code calls this, never from inside
      * the report's lock, so the summary's list write may take it. */
     xbox_missing_summary("bugcheck");
+    fflush(stderr);   /* stderr is buffered by some hosts */
     ExitProcess(BugCheckCode);
 }
 
@@ -1269,6 +1271,7 @@ VOID __stdcall xbox_HalReturnToFirmware(ULONG Routine)
     /* stderr too: the kernel log file is rewritten on every run, so a title
      * that ends itself otherwise leaves no trace in the run's own log. */
     fprintf(stderr, "[EXIT] HalReturnToFirmware routine=%u\n", (unsigned)Routine);
+    fflush(stderr);   /* stderr is buffered by some hosts */
     ExitProcess(0);
 }
 
@@ -1276,6 +1279,7 @@ VOID __stdcall xbox_HalInitiateShutdown(void)
 {
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL, "HalInitiateShutdown (exiting)");
     fprintf(stderr, "[EXIT] HalInitiateShutdown\n");
+    fflush(stderr);   /* stderr is buffered by some hosts */
     ExitProcess(0);
 }
 

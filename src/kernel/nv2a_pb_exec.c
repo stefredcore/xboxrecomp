@@ -2144,6 +2144,17 @@ static int batch_is_screen_space(void)
 static int s_drawn_dumps;
 
 static void dump_surface_bmp(void);
+static void frame_time_note(uint64_t now_ns);
+
+/* The frame copied at FLIP_STALL goes on screen: at the stall when nothing
+ * holds it, else when the hold releases on its vblank (fb_present.c). */
+extern void xbox_FramebufferWindowDefer(int on);
+extern void xbox_FramebufferWindowPublish(void);
+static void present_publish(uint64_t now_ns)
+{
+    xbox_FramebufferWindowPublish();
+    frame_time_note(now_ns);
+}
 
 /* A fixed-function batch without texture coordinates is drawn untextured, as
  * the screen-space path does, whatever stale texture the stage still holds. */
@@ -4407,6 +4418,11 @@ static uint32_t flip_clock(uint64_t now_ns, int *ok)
 }
 
 /* Once per pass of the ack loop: 1 while a flip is held. */
+int nv2a_pb_exec_flip_held(void)
+{
+    return s_flip_hold.held;
+}
+
 int nv2a_pb_exec_flip_poll(void)
 {
     uint64_t now;
@@ -4417,7 +4433,10 @@ int nv2a_pb_exec_flip_poll(void)
         return 0;
     now = xbox_HostNowNs();
     c = flip_clock(now, &ok);
-    return xbox_FlipHoldPoll(&s_flip_hold, c, now, ok);
+    if (xbox_FlipHoldPoll(&s_flip_hold, c, now, ok))
+        return 1;
+    present_publish(now);                        /* released on its vblank */
+    return 0;
 }
 
 /* The hold's line in the periodic [GPU] report, then reset. */
@@ -4844,6 +4863,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
                                                 : s_gpu.pitch;
             if (done) {
+                xbox_FramebufferWindowDefer(nv2a_pb_exec_flip_pacing() != 0);
                 xbox_FramebufferWindowSet(dma_resolve(done), pitch);
                 xbox_FramebufferWindowSetAA(s_gpu.aa_sy > 1.5f ? 2 : 1);
                 xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
@@ -4893,6 +4913,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             xbox_FlipHoldStall(&s_flip_hold, stall_vbl, stall_ns,
                                clock_ok && !nv2a_pb_scan_in_call());
         }
+        if (!s_flip_hold.held)
+            present_publish(stall_ns);
         return;
     }
 
@@ -5167,6 +5189,21 @@ static void peek_chain(void)
     fflush(stderr);
 }
 
+/* Time between flips, as the report's histogram: an average fps hides the
+ * frames that miss their vblank, and those are what a player sees as
+ * judder. Buckets: <18, 18-23, 23-35, 35-45, >=45 ms (a 50 Hz frame is 20). */
+static uint64_t s_ft_prev_ns;
+static uint32_t s_ft_hist[5];
+
+static void frame_time_note(uint64_t now_ns)
+{
+    if (s_ft_prev_ns) {
+        uint64_t ms = (now_ns - s_ft_prev_ns) / 1000000u;
+        s_ft_hist[ms < 18 ? 0 : ms < 23 ? 1 : ms < 35 ? 2 : ms < 45 ? 3 : 4]++;
+    }
+    s_ft_prev_ns = now_ns;
+}
+
 void nv2a_pb_exec_report(void)
 {
     peek_addresses();
@@ -5189,9 +5226,12 @@ void nv2a_pb_exec_report(void)
         static unsigned long last_ms;
         unsigned long now = (unsigned long)(clock() * 1000.0 / CLOCKS_PER_SEC);
         if (last_ms && now > last_ms)
-            fprintf(stderr, "[GPU] %.2f fps (%u flips)%c",
+            fprintf(stderr, "[GPU] %.2f fps (%u flips); frame times <18 %u, 18-23 %u,"
+                            " 23-35 %u, 35-45 %u, 45+ %u ms%c",
                     (s_gpu.flips - last_flips) * 1000.0 / (now - last_ms),
-                    s_gpu.flips, 10);
+                    s_gpu.flips, s_ft_hist[0], s_ft_hist[1], s_ft_hist[2],
+                    s_ft_hist[3], s_ft_hist[4], 10);
+        memset(s_ft_hist, 0, sizeof s_ft_hist);
         last_flips = s_gpu.flips;
         last_ms = now;
     }

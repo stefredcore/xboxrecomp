@@ -363,6 +363,19 @@ static void pb_consume(const uint8_t *mem, uint32_t put, uint32_t *words)
     }
 }
 
+/* A held flip stops the walk at its FLIP_STALL, as it stops the GPU on the
+ * console; the poll loop resumes it from there once the flip's vblank has
+ * come, even if PUT has not moved. Holding only at the end of a walk let
+ * every earlier flip in it through at once: Nightfire's main game, a frame
+ * ahead, put two frames in most walks, and they reached the screen in pairs. */
+extern int nv2a_pb_exec_flip_held(void);
+static int s_walk_stopped;
+
+int nv2a_pb_walk_stopped(void)
+{
+    return s_walk_stopped;
+}
+
 void nv2a_pb_scan(uint32_t put_phys)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -380,6 +393,7 @@ void nv2a_pb_scan(uint32_t put_phys)
         get_reg = xbox_Nv2aRegPtr(NV2A_USER_DMA_GET);
     s_pass_get0 = s_get;
     s_pass_put0 = put;
+    s_walk_stopped = 0;
 
     pb_consume(mem, put, &words);             /* the method PUT stalled inside */
 
@@ -497,6 +511,10 @@ void nv2a_pb_scan(uint32_t put_phys)
             s_pend_noninc = noninc;
             pb_consume(mem, put, &words);
             unknown = 0;
+            if (!s_pend_left && s_get != put && nv2a_pb_exec_flip_held()) {
+                s_walk_stopped = 1;
+                break;
+            }
             continue;
         }
         unknown++;

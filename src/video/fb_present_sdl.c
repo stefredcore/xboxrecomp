@@ -165,6 +165,17 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
     __atomic_sub_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
 }
 
+/* Vblank-timed presenting (fb_present.c) is not done here: frames are shown
+ * as Present delivers them, as before. */
+void xbox_FramebufferWindowDefer(int on)
+{
+    (void)on;
+}
+
+void xbox_FramebufferWindowPublish(void)
+{
+}
+
 /* Title bar: "<XBE title> | FPS: n | draws: n", as the GDI window shows it.
  * Written by the loader and the flip, read once a second by the main
  * thread; a torn read shows one stale value for a second. */

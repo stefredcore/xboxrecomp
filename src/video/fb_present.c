@@ -279,6 +279,27 @@ static void present_dump(const uint32_t *img, uint32_t fb_va, uint32_t pitch)
 }
 
 /* Called by the pushbuffer executor when the title flips. */
+/* A finished frame copied but not yet shown (xbox_FramebufferWindowDefer). */
+static volatile LONG s_pending_idx = -1;
+static volatile LONG s_defer;
+
+/* With deferral on, Present only copies the frame; it reaches the screen at
+ * xbox_FramebufferWindowPublish, which the executor calls on the vblank the
+ * flip completes on. On the console the picture changes only at a vblank;
+ * shown the moment the GPU finished it, a 50 fps title's frames stood on
+ * screen for 15 ms, then 25 -- the right rate, and visibly uneven. */
+void xbox_FramebufferWindowDefer(int on)
+{
+    InterlockedExchange(&s_defer, on ? 1 : 0);
+}
+
+void xbox_FramebufferWindowPublish(void)
+{
+    LONG idx = InterlockedExchange(&s_pending_idx, -1);
+    if (idx >= 0)
+        InterlockedExchange(&s_present_idx, idx);
+}
+
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
 {
     const uint8_t *src;
@@ -337,8 +358,11 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
         }
     }
     present_dump(s_present[next], fb_va, pitch);
-    /* Published only once it is whole. */
-    InterlockedExchange(&s_present_idx, next);
+    /* Published only once it is whole -- and, deferred, at its vblank. */
+    if (s_defer)
+        InterlockedExchange(&s_pending_idx, next);
+    else
+        InterlockedExchange(&s_present_idx, next);
 }
 
 /* Title bar, the way ps3recomp's window shows it. Written by the flip,
