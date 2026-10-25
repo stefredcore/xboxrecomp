@@ -205,15 +205,33 @@ void xbox_FramebufferWindowSetAA(uint32_t sy)
     s_fb_aa_sy = sy ? sy : 1;
 }
 
+/* The convolution kernel the title filters its 2x1 surface with, as the
+ * executor saw it sampled: 0 none (plain average), 1 quincunx. */
+static uint32_t s_fb_aa_kernel;
+
+void xbox_FramebufferWindowSetAAKernel(uint32_t kernel)
+{
+    s_fb_aa_kernel = kernel;
+}
+
 /* One shown row of a 2x-wide anti-aliased 32-bit surface. The console's
  * scan-out filters the 2x1 (or 2x2, s_fb_aa_sy 2) samples behind each pixel
  * into one; taking every other sample instead showed the aliasing the title
  * paid twice the fill rate to remove. Averaged per channel, rounded.
- * RECOMP_FB_AA_RESOLVE=0 takes every other sample, as before. */
+ * RECOMP_FB_AA_RESOLVE=0 takes every other sample, as before.
+ *
+ * A title that asks for QUINCUNX (Nightfire's driving missions) filters the
+ * surface into its front buffer with the texture unit's quincunx kernel:
+ * the centre texel at 1/2 and its four diagonal neighbours, the other sample
+ * column in the rows above and below, at 1/8 each. The window shows the
+ * surface before that blit, so the same kernel is applied here; above and
+ * below are the neighbouring 2x-wide rows (the row itself at the edges).
+ * RECOMP_FB_AA_QUINCUNX=0 keeps the plain average. */
 static void aa_resolve_row(uint32_t *dst, const uint8_t *row, uint32_t pitch,
-                           uint32_t width)
+                           uint32_t width, const uint8_t *above,
+                           const uint8_t *below)
 {
-    static int on = -1;
+    static int on = -1, quincunx = -1;
     const uint32_t m = 0x00FF00FFu;
     const uint32_t *p = (const uint32_t *)row;
     const uint32_t *q = (const uint32_t *)(row + pitch);
@@ -222,10 +240,23 @@ static void aa_resolve_row(uint32_t *dst, const uint8_t *row, uint32_t pitch,
     if (on < 0) {
         const char *e = getenv("RECOMP_FB_AA_RESOLVE");
         on = !(e && e[0] == '0');
+        e = getenv("RECOMP_FB_AA_QUINCUNX");
+        quincunx = !(e && e[0] == '0');
     }
     if (!on) {
         for (x = 0; x < width; x++)
             dst[x] = p[x * 2];
+    } else if (s_fb_aa_sy == 1 && s_fb_aa_kernel == 1 && quincunx) {
+        const uint32_t *u = (const uint32_t *)above, *d = (const uint32_t *)below;
+        for (x = 0; x < width; x++) {
+            uint32_t l = x ? x * 2 - 1 : 1, r = x * 2 + 1;
+            uint32_t c = p[x * 2], a = u[l], b = u[r], e = d[l], f = d[r];
+            uint32_t lo = (((c & m) << 2) + (a & m) + (b & m) + (e & m) + (f & m)
+                           + 0x00040004u) >> 3;
+            uint32_t hi = ((((c >> 8) & m) << 2) + ((a >> 8) & m) + ((b >> 8) & m)
+                           + ((e >> 8) & m) + ((f >> 8) & m) + 0x00040004u) >> 3;
+            dst[x] = (lo & m) | ((hi & m) << 8);
+        }
     } else if (s_fb_aa_sy == 2) {
         for (x = 0; x < width; x++) {
             uint32_t a = p[x * 2], b = p[x * 2 + 1], c = q[x * 2], d = q[x * 2 + 1];
@@ -379,7 +410,8 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
             memcpy(dst, row, (size_t)s_fb_width * 4);
         } else if (bpp == 8) {
             /* 2x-wide anti-aliased 32-bit surface, as in fb_convert. */
-            aa_resolve_row(dst, row, pitch, s_fb_width);
+            aa_resolve_row(dst, row, pitch, s_fb_width, y ? row - pitch : row,
+                           y + 1 < s_fb_height ? row + pitch : row);
         } else if (bpp == 2) {
             const uint16_t *p = (const uint16_t *)row;
             for (x = 0; x < s_fb_width; x++) {
@@ -573,7 +605,9 @@ static void fb_convert(const uint8_t *src, uint32_t bpp)
              * filtered down (aa_resolve_row). X-Men Legends renders its
              * 640-wide frame into a 1280-wide surface, which read as "8
              * bytes per pixel" and showed black. */
-            aa_resolve_row(dst, row, s_fb_pitch, s_fb_width);
+            aa_resolve_row(dst, row, s_fb_pitch, s_fb_width,
+                           y ? row - s_fb_pitch : row,
+                           y + 1 < s_fb_height ? row + s_fb_pitch : row);
         } else if (bpp == 2) {
             const uint16_t *p = (const uint16_t *)row;
             for (x = 0; x < s_fb_width; x++) {

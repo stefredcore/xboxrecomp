@@ -52,6 +52,7 @@ extern void xbox_Nv2aSignalSoftwareMethod(uint32_t method);
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 extern void xbox_FramebufferWindowSetAA(uint32_t sy);
+extern void xbox_FramebufferWindowSetAAKernel(uint32_t kernel);
 extern uint32_t xbox_Nv2aFenceWordVa(void);
 extern int nv2a_pb_dma_walk(void);   /* nv2a_pb_scan.c: RECOMP_PB_WALK=dma */
 extern void xbox_FramebufferWindowStart(void);
@@ -4355,6 +4356,21 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         break;
     case 0x1B14:                                  /* SET_TEXTURE_FILTER */
         t->filter = param;
+        /* A convolution kernel on the surface just drawn is the title
+         * resolving its anti-aliasing (D3D's QUINCUNX or GAUSSIAN types). The
+         * window shows that surface before the resolve blit, so it is told
+         * which kernel to apply (aa_resolve_row; only a 2x-wide one uses it). */
+        if ((param & 0xE000u)
+                && ((t->offset ^ s_gpu.drawn_offset) & 0x03FFFFFFu) == 0) {
+            static uint32_t told;
+            uint32_t kernel = (param >> 13) & 7;
+            if (kernel != told) {
+                told = kernel;
+                xbox_FramebufferWindowSetAAKernel(kernel);
+                fprintf(stderr, "  [NV2A] anti-aliasing resolved with convolution kernel %u\n",
+                        kernel);
+            }
+        }
         break;
     case 0x1B24:                                  /* SET_TEXTURE_BORDER_COLOR */
         t->border = param;

@@ -62,6 +62,8 @@ void xbox_FramebufferWindowStart(void);
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 /* Rows per displayed row: 2 for a 2x2 anti-aliased surface, else 1. */
 void xbox_FramebufferWindowSetAA(uint32_t sy);
+/* Convolution kernel the title resolves its 2x1 surface with: 0 none, 1 quincunx. */
+void xbox_FramebufferWindowSetAAKernel(uint32_t kernel);
 int  xbox_FramebufferDumpBmp(const char *path);
 /* Title bar: "<XBE title> | FPS: n | draws: n". The name is the certificate's
  * UTF-16 title (40 chars max); the stats come from each flip. */
