@@ -94,7 +94,23 @@ typedef struct {
      * that ignores these draws that pass over the whole surface. */
     uint32_t stencil_enable, stencil_func, stencil_ref, stencil_func_mask;
     uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
+    /* SET_POLY_OFFSET_FILL_ENABLE and SET_POLYGON_OFFSET_SCALE_FACTOR/_BIAS,
+     * as glPolygonOffset takes them: depth moves by factor times the
+     * triangle's depth slope plus units times the smallest step of the depth
+     * buffer. A decal or shadow laid on a wall gets it so it is not drawn
+     * at the wall's own depth; a back end that ignores it lets the two take
+     * turns winning the depth test from frame to frame. */
+    uint32_t poly_offset_fill;
+    float    poly_offset_factor, poly_offset_units;
+    /* SET_CONTROL0 Z_PERSPECTIVE_ENABLE (bit 16): a W-buffer. The depth
+     * stored is the vertex's w (1/rhw), interpolated perspective-correctly
+     * and mapped from [depth_min, depth_max] to the buffer's range, not z.
+     * Linear in distance, so far away it still tells apart two surfaces a
+     * z-buffer of the same width cannot. */
+    uint32_t z_perspective;
 } Nv2aRenderState;
+#define NV2A_BACKEND_POLY_OFFSET 1   /* the three fields above exist */
+#define NV2A_BACKEND_Z_PERSPECTIVE 1 /* z_perspective exists */
 
 /* Everything the CPU rasteriser interpolates per pixel when the register
  * combiners are in use (xf_rows in nv2a_pb_exec.c): both vertex colours, the
