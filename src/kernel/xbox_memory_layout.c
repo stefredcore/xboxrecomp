@@ -3995,6 +3995,8 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 #define XBOX_MAX_THREAD_STACKS  8
 
 static int g_thread_stacks_used = 0;
+/* Base of each live worker stack, 0 when free; for xbox_IsThreadStackVA. */
+static volatile uint32_t g_thread_stack_bases[XBOX_MAX_THREAD_STACKS];
 
 /* A TIB and TLS block for a newly spawned guest thread.
  *
@@ -4070,6 +4072,11 @@ uint32_t xbox_AllocThreadStack(void)
     if (!base)
         return 0;
     g_thread_stacks_used++;
+    for (int i = 0; i < XBOX_MAX_THREAD_STACKS; i++)
+        if (!g_thread_stack_bases[i]) {
+            g_thread_stack_bases[i] = base;
+            break;
+        }
 
     /* Top of the slice, 16-byte aligned, growing down. */
     return base + XBOX_THREAD_STACK_SIZE - 16;
@@ -4091,11 +4098,29 @@ uint32_t xbox_AllocThreadStack(void)
  */
 void xbox_FreeThreadStack(uint32_t stack_top)
 {
+    uint32_t base;
+
     if (!stack_top)
         return;
-    xbox_HeapFree(stack_top + 16 - XBOX_THREAD_STACK_SIZE);
+    base = stack_top + 16 - XBOX_THREAD_STACK_SIZE;
+    for (int i = 0; i < XBOX_MAX_THREAD_STACKS; i++)
+        if (g_thread_stack_bases[i] == base)
+            g_thread_stack_bases[i] = 0;
+    xbox_HeapFree(base);
     if (g_thread_stacks_used > 0)
         g_thread_stacks_used--;
+}
+
+int xbox_IsThreadStackVA(uint32_t va)
+{
+    if (va >= XBOX_STACK_BASE && va < XBOX_STACK_BASE + XBOX_STACK_SIZE)
+        return 1;
+    for (int i = 0; i < XBOX_MAX_THREAD_STACKS; i++) {
+        uint32_t base = g_thread_stack_bases[i];
+        if (base && va >= base && va < base + XBOX_THREAD_STACK_SIZE)
+            return 1;
+    }
+    return 0;
 }
 
 /* Page allocator over the contiguous window mapped at XBOX_CONTIG_BASE.

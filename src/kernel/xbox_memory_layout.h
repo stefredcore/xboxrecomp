@@ -570,6 +570,10 @@ uint32_t xbox_AllocThreadTib(void);
  */
 void xbox_FreeThreadStack(uint32_t stack_top);
 
+/* Whether va lies on a guest thread's stack: the main thread's region or a
+ * worker stack xbox_AllocThreadStack handed out and nobody has freed. */
+int xbox_IsThreadStackVA(uint32_t va);
+
 /* Worker stack slices for host-tick-driven titles (see XBOX_WORKER_STACK_* and
  * docs/technical/burnout3-reunification.md). Additive; unused by default-model
  * titles. */

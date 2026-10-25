@@ -8184,7 +8184,8 @@ static HANDLE ke_guest_event(uint32_t guest_va, int *type)
                 g_ke_shadow[i].guest_va    = guest_va;
                 g_ke_shadow[i].host_handle = h;
                 g_ke_shadow[i].waiters     = 0;
-                if (InterlockedExchange(&g_pending_nv2a_software_interrupt, 0)) {
+                if (!xbox_IsThreadStackVA(guest_va)
+                        && InterlockedExchange(&g_pending_nv2a_software_interrupt, 0)) {
                     BRIDGE_MEM32(guest_va + 4) = 1;
                     SetEvent(h);
                 }
@@ -8229,7 +8230,12 @@ static void ke_guest_event_wait_ref(uint32_t guest_va, int delta)
  * pushbuffer writer overwrote commands the GPU had not read yet.
  *
  * A bound event is set only by its method, and a bound method sets only its
- * events. Everything else keeps the old signal-all behaviour. */
+ * events. Everything else keeps the old signal-all behaviour, except events on
+ * a thread stack: D3D's handler only sets the device's own events. A title
+ * waits on a stack event once and returns, but its shadow stays in the table,
+ * and signal-all then wrote SignalState = 1 into whatever frame lived there
+ * later. In Nightfire that was the saved ebx of DirectSound's stream Process,
+ * which then failed and ended every movie early. */
 #define SOFTMETHOD_BINDS 8
 static struct { uint32_t method, guest_va; } g_softmethod_bind[SOFTMETHOD_BINDS];
 static int g_softmethod_binds;
@@ -8290,7 +8296,8 @@ void xbox_Nv2aSignalSoftwareMethod(uint32_t method)
     int signaled = 0;
     for (uint32_t i = 0; i < KE_SHADOW_SIZE; i++) {
         KE_SHADOW_SLOT *slot = &g_ke_shadow[i];
-        if (slot->in_use == 2 && softmethod_sets(method, slot->guest_va)) {
+        if (slot->in_use == 2 && !xbox_IsThreadStackVA(slot->guest_va)
+                && softmethod_sets(method, slot->guest_va)) {
             BRIDGE_MEM32(slot->guest_va + 4) = 1;
             SetEvent(slot->host_handle);
             signaled++;
