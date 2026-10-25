@@ -4482,6 +4482,19 @@ uint32_t xbox_ContiguousInUseBytes(void)
  * most one pass of one voice. */
 static volatile uint8_t g_phys_ram_named[CONTIG_PAGES];
 
+/* RECOMP_APU_IMAGE_NAMES=0 turns the image half of xbox_PhysNoteRamName off
+ * again, for A/B runs: open question whether it touches the driving missions'
+ * radio calls (2026-10-25). */
+static int image_names_off(void)
+{
+    static int off = -1;
+    if (off < 0) {
+        const char *e = getenv("RECOMP_APU_IMAGE_NAMES");
+        off = e && *e == '0';
+    }
+    return off;
+}
+
 void xbox_PhysNoteRamName(uint32_t va)
 {
     if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE)
@@ -4493,7 +4506,8 @@ void xbox_PhysNoteRamName(uint32_t va)
      * window: graphics data as PCM, a loud tone locked to the 32-sample frame
      * (1500 Hz and its harmonics). Image pages are never freed, so nothing
      * clears these. */
-    else if (va >= g_xbox_image_lo && va < g_xbox_image_hi && va < XBOX_CONTIG_SIZE)
+    else if (va >= g_xbox_image_lo && va < g_xbox_image_hi && va < XBOX_CONTIG_SIZE
+             && !image_names_off())
         g_phys_ram_named[va / CONTIG_PAGE] = 1;
 }
 

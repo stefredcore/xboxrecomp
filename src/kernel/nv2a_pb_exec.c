@@ -3511,7 +3511,10 @@ static int transform_span(uint32_t base, uint32_t n)
         s_xfsrc[i] = -1;
         s_xfu[nu++] = i;
     }
-    /* The unique ones, on the pool when there are enough of them. */
+    /* The unique ones, on the pool when there are enough of them. The
+     * program is decoded here, before any worker runs it. */
+    if (batch_uses_program())
+        nv2a_vsh_prepare();
     threads = nu >= XF_MT_MIN && batch_uses_program() ? xf_pool_size() : 1;
     s_xfp.failed = 0;
     if (threads > 1)
