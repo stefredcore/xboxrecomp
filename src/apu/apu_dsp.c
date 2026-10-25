@@ -114,6 +114,21 @@ static int mcpx_apu_mixdown_all(void)
     return on;
 }
 
+/* The mono bins of DirectSound's layout -- 2 front centre, 3 LFE, 10 the
+ * I3DL2 reverb send -- go to both sides at -3 dB, as a stereo downmix puts
+ * them. Under even-left/odd-right the centre came out on the left speaker
+ * only: Nightfire routes its radio speech there (V0BIN 2, V1BIN muted).
+ * RECOMP_APU_CENTER_BOTH=0 is the old even/odd split for those bins too. */
+static int mcpx_apu_center_both(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_CENTER_BOTH");
+        on = (e && *e) ? (atoi(e) != 0) : 1;
+    }
+    return on;
+}
+
 /* GPRST (GP region + 0xFFFC): the GP runs only with both reset bits set, as
  * in xemu's gp_write. Nothing else models the GP, so this is kept for the
  * =auto ack alone. Before the first write the GP counts as running: a title
@@ -279,11 +294,19 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
              * mixdown that stops discarding audio. */
             float left, right;
             if (mcpx_apu_mixdown_all()) {
+                int both = mcpx_apu_center_both();
                 left = 0.0f;
                 right = 0.0f;
                 for (int b = 0; b < NUM_MIXBINS; ++b) {
-                    if (b & 1) right += mixbins[b][i];
-                    else       left  += mixbins[b][i];
+                    if (both && (b == 2 || b == 3 || b == 10)) {
+                        float m = 0.70710678f * mixbins[b][i];
+                        left += m;
+                        right += m;
+                    } else if (b & 1) {
+                        right += mixbins[b][i];
+                    } else {
+                        left += mixbins[b][i];
+                    }
                 }
             } else {
                 left = mixbins[0][i];
