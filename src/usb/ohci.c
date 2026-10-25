@@ -1555,6 +1555,48 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
     if (!hc)
         return 0;
     off = xbox_va - base;
+    /* RECOMP_OHCI_TRAPSTATS: every five seconds, how many register accesses
+     * trapped and which registers took them. Each one is a host exception,
+     * tens of microseconds; a driver that polls a register in a loop pays
+     * that per iteration. */
+    {
+        static int on = -1;
+        static unsigned per_off[2][64];
+        static unsigned n;
+        static DWORD last;
+        if (on < 0)
+            on = getenv("RECOMP_OHCI_TRAPSTATS") != NULL;
+        if (on) {
+            DWORD now = GetTickCount();
+            per_off[hc->index & 1][(off >> 2) & 63]++;
+            n++;
+            if (now - last >= 5000) {
+                int h, k, best[6], nb = 0;
+                fprintf(stderr, "  [OHCI-TRAPS] %u in %lu ms (%.0f/s):", n,
+                        (unsigned long)(last ? now - last : 0),
+                        last ? n * 1000.0 / (now - last) : 0.0);
+                for (h = 0; h < 2; h++) {
+                    for (nb = 0; nb < 6; nb++) {
+                        best[nb] = -1;
+                        for (k = 0; k < 64; k++) {
+                            int used = 0, j;
+                            for (j = 0; j < nb; j++) if (best[j] == k) used = 1;
+                            if (!used && per_off[h][k]
+                                && (best[nb] < 0 || per_off[h][k] > per_off[h][best[nb]]))
+                                best[nb] = k;
+                        }
+                        if (best[nb] < 0)
+                            break;
+                        fprintf(stderr, " hc%d+%03X:%u", h, best[nb] * 4, per_off[h][best[nb]]);
+                    }
+                }
+                fputc('\n', stderr);
+                memset(per_off, 0, sizeof per_off);
+                n = 0;
+                last = now;
+            }
+        }
+    }
     ok = mmio_emulate((PCONTEXT)ctx, off, hc,
                       ohci_read_split, ohci_write_split);
     if (!ok && hc->decode_fail++ < 20) {

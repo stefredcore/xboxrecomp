@@ -1396,6 +1396,23 @@ static void framebuffer_probe_tick(void)
  * and a level load, thousands of kickoffs long, looked frozen. Clearing them
  * from inside the walk answers the kickoff within a few hundred commands,
  * without a thread of its own spinning on a host core. */
+/* RECOMP_FLIP_HOLD_PFB=1: a held flip also holds the PFB flush ack, as it
+ * used to. On the console the write-combine flush finishes whatever the GPU
+ * is doing, and a title feels FLIP_STALL through DMA_GET and its fences, which
+ * the hold keeps back anyway. Holding the flush as well stopped the CPU at its
+ * next kickoff for the whole hold, where the console lets it build the next
+ * frame meanwhile: Nightfire's driving missions lost a third of their frames
+ * to it, and its menus stay at 50 without it. */
+static int flip_hold_pfb(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_FLIP_HOLD_PFB");
+        on = e && *e == '1';
+    }
+    return on;
+}
+
 static void nv2a_ack_busy_bits(int flip_held)
 {
     volatile uint32_t *regs = (volatile uint32_t *)g_nv2a_memory;
@@ -1406,7 +1423,7 @@ static void nv2a_ack_busy_bits(int flip_held)
         volatile uint32_t *r =
             (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
         uint32_t mask = NV2A_ACK[i].busy_mask;
-        if (flip_held && NV2A_ACK[i].offset == NV2A_ACK_PFB_FLUSH)
+        if (flip_held && NV2A_ACK[i].offset == NV2A_ACK_PFB_FLUSH && flip_hold_pfb())
             continue;
         /* Once the vblank is delivered its two bits belong to the
          * vblank-ack thread (kernel_bridge.c), which clears them on the
@@ -1447,8 +1464,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         /* A flip held for its vblank (nv2a_flip_hold.h): this pass walks
-         * nothing, leaves DMA_GET where it is and acknowledges no PFB flush,
-         * which is how the title feels the console's FLIP_STALL. Nothing is
+         * nothing and leaves DMA_GET where it is, which is how the title
+         * feels the console's FLIP_STALL (flip_hold_pfb). Nothing is
          * locked while it waits; the release depends only on the vblank
          * count and the clock.
          *
@@ -1588,13 +1605,26 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         nv2a_pb_scan_report();
                     }
                 }
-                /* Consumed, now that it has actually been executed. */
+                /* Consumed, now that it has actually been executed. The DMA
+                 * walk keeps GET itself and leaves it where it actually stopped
+                 * -- past this pass's PUT when the title reset the ring mid-walk
+                 * (nv2a_pb_scan follows the new PUT) -- so it is read back, not
+                 * overwritten with the PUT this pass started from. */
                 {
                     volatile uint32_t *get =
                         (volatile uint32_t *)((char *)regs
                                               + NV2A_USER_DMA_GET);
-                    *get = put;
-                    get_written = put;
+                    extern int nv2a_pb_dma_walk(void);
+                    if (nv2a_pb_dma_walk()) {
+                        /* What the walk published, not what the register
+                         * holds: a reset the title made since must still
+                         * look like one on the next tick. */
+                        extern uint32_t nv2a_pb_walk_get(void);
+                        get_written = nv2a_pb_walk_get();
+                    } else {
+                        *get = put;
+                        get_written = put;
+                    }
                 }
                 last_put = put; last_put_ms = now_ms;
                 /* GET as well as PUT. A title that stops submitting has either

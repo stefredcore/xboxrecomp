@@ -1207,7 +1207,7 @@ static void clear_surface(uint32_t param)
 }
 
 
-/* ── Rasteriser ──────────────────────────────────────────────────────────
+/* â”€â”€ Rasteriser â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
  *
  * Fills triangles straight into the guest framebuffer, the same memory
  * clear_surface() writes and the framebuffer window already shows. That is the
@@ -3330,15 +3330,250 @@ static void xf_set_viewport(void)
     s_xf_o[2] = reg_f(0x0398) > reg_f(0x0394) ? reg_f(0x0394) : 0.0f;
 }
 
+/* Each vertex once per batch. An indexed mesh names most vertices from two to
+ * six triangles, and every index used to be run through the vertex program
+ * again -- in Nightfire's levels that was a quarter of the NV2A thread. The
+ * output depends only on the index (the attributes it fetches) and on state
+ * that cannot change inside a batch, so a repeated index copies the first
+ * result. A small open-addressing table keyed by index, reset per batch by a
+ * generation count; a batch too large for it is transformed as before.
+ * RECOMP_XF_CHECK=1 transforms every index anyway and counts results that
+ * differ from the copy (a program that reads a register it never wrote
+ * would make them depend on the previous vertex). */
+#define XF_MEMO_SIZE 8192                      /* power of two */
+static uint32_t s_xfm_key[XF_MEMO_SIZE], s_xfm_pos[XF_MEMO_SIZE], s_xfm_gen[XF_MEMO_SIZE];
+static uint32_t s_xfm_cur;
+static uint64_t s_xf_check_n, s_xf_check_bad, s_xf_reused;
+static uint64_t s_xf_inorder, s_xf_alone, s_xf_pooled;  /* vertices by path */
+
+/* The unique vertices of a batch are transformed on a small pool of threads
+ * as well: each one reads only guest memory and state that is fixed for the
+ * batch, and writes only its own s_xf slot. Not for a program that writes
+ * c[] (nv2a_vsh_writes_constants), which runs one vertex at a time as before,
+ * nor below XF_MT_MIN unique vertices, where waking the pool costs more than
+ * it saves; only as many workers are woken as there are chunks to share.
+ * RECOMP_XF_THREADS sets the pool size (default cores / 2, at most 8; 1 turns
+ * it off).
+ *
+ * The vertices are claimed XF_CHUNK at a time rather than dealt out in fixed
+ * shares: with a fixed share the caller finished its own and then waited for
+ * the slowest worker -- one still waking up, or on a slower core of a hybrid
+ * CPU -- and that wait was an eighth of the GPU thread's time in the driving
+ * missions. A worker that wakes after the work is gone finds nothing to claim.
+ * The batch's vertex count rides in the same 64-bit word as the claim counter,
+ * so a claim always pairs an index with the count of the batch it belongs to;
+ * between batches the count is 0.
+ *
+ * A worker that has finished watches that word for XF_SPIN_US before it goes
+ * to sleep on its event. Batches come hundreds a frame, back to back, so a
+ * watching worker joins the next one at once; woken through an event it came
+ * in tens of microseconds late, after the caller had done most of the batch
+ * alone, and the SetEvent calls themselves were 5% of the GPU thread. */
+#define XF_MT_MAX 8
+#define XF_MT_MIN 64
+#define XF_CHUNK  16
+#define XF_SPIN_US 200
+static uint32_t s_xfu[NV_MAX_INDICES];          /* positions of unique vertices */
+static int32_t  s_xfsrc[NV_MAX_INDICES];        /* repeat: position it copies; -1 unique */
+static struct {
+    int n;                                      /* threads incl. the caller */
+    HANDLE start[XF_MT_MAX];
+    volatile LONG asleep[XF_MT_MAX];            /* waiting on start[k] */
+    volatile LONG64 claim;                      /* count << 32 | next to claim */
+    volatile LONG done, failed;                 /* vertices finished */
+    uint32_t count;
+} s_xfp;
+
+/* Claim and transform chunks until none are left. */
+static void xf_unique_claim(void)
+{
+    for (;;) {
+        LONG64 v = InterlockedExchangeAdd64(&s_xfp.claim, XF_CHUNK);
+        uint32_t j = (uint32_t)v, c = (uint32_t)((uint64_t)v >> 32), e, k;
+        if (j >= c)
+            return;
+        e = j + XF_CHUNK < c ? j + XF_CHUNK : c;
+        for (k = j; k < e; k++) {
+            uint32_t i = s_xfu[k];
+            if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
+                InterlockedExchange(&s_xfp.failed, 1);
+        }
+        InterlockedExchangeAdd(&s_xfp.done, (LONG)(e - j));
+    }
+}
+
+static void xf_unique_range(int k, int n)
+{
+    uint32_t j;
+    for (j = (uint32_t)k; j < s_xfp.count; j += (uint32_t)n) {
+        uint32_t i = s_xfu[j];
+        if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
+            InterlockedExchange(&s_xfp.failed, 1);
+    }
+}
+
+/* Whether the current batch has chunks left to claim. */
+static int xf_claimable(void)
+{
+    LONG64 v = s_xfp.claim;
+    return (uint32_t)v < (uint32_t)((uint64_t)v >> 32);
+}
+
+static DWORD WINAPI xf_worker(LPVOID arg)
+{
+    int k = (int)(intptr_t)arg;
+    LARGE_INTEGER f, t0, t;
+    QueryPerformanceFrequency(&f);
+    for (;;) {
+        unsigned n = 0;
+        QueryPerformanceCounter(&t0);
+        for (;;) {                                /* watch for the next batch */
+            if (xf_claimable()) {
+                xf_unique_claim();
+                QueryPerformanceCounter(&t0);
+                continue;
+            }
+            YieldProcessor();
+            if ((++n & 63) == 0) {
+                QueryPerformanceCounter(&t);
+                if ((t.QuadPart - t0.QuadPart) * 1000000 > f.QuadPart * XF_SPIN_US)
+                    break;
+            }
+        }
+        InterlockedExchange(&s_xfp.asleep[k], 1);
+        if (!xf_claimable())                      /* a batch published meanwhile */
+            WaitForSingleObject(s_xfp.start[k], INFINITE);
+        InterlockedExchange(&s_xfp.asleep[k], 0);
+    }
+    return 0;
+}
+
+static int xf_pool_size(void)
+{
+    static int init;
+    if (!init) {
+        const char *e = getenv("RECOMP_XF_THREADS");
+        SYSTEM_INFO si;
+        int n, k;
+        init = 1;
+        GetSystemInfo(&si);
+        n = e ? atoi(e) : (int)si.dwNumberOfProcessors / 2;
+        if (n < 1) n = 1;
+        if (n > XF_MT_MAX) n = XF_MT_MAX;
+        s_xfp.n = n;
+        if (n > 1) {
+            for (k = 0; k < n - 1; k++) {
+                s_xfp.start[k] = CreateEventA(NULL, FALSE, FALSE, NULL);
+                CloseHandle(CreateThread(NULL, 0, xf_worker, (LPVOID)(intptr_t)k, 0, NULL));
+            }
+        }
+    }
+    return s_xfp.n;
+}
+
+/* Positions base .. base + n - 1 of the batch, n at most XF_MEMO_SIZE / 2. */
+static int transform_span(uint32_t base, uint32_t n)
+{
+    static int check = -1;
+    uint32_t i, nu = 0, end = base + n;
+    int threads;
+
+    if (check < 0)
+        check = getenv("RECOMP_XF_CHECK") != NULL;
+    if (++s_xfm_cur == 0) {                       /* generation wrapped */
+        memset(s_xfm_gen, 0, sizeof s_xfm_gen);
+        s_xfm_cur = 1;
+    }
+    /* Which positions are first uses and which repeat an earlier one. */
+    for (i = base; i < end; i++) {
+        uint32_t idx = s_gpu.idx[i];
+        uint32_t h = (idx * 2654435761u) & (XF_MEMO_SIZE - 1);
+        while (s_xfm_gen[h] == s_xfm_cur && s_xfm_key[h] != idx)
+            h = (h + 1) & (XF_MEMO_SIZE - 1);
+        if (s_xfm_gen[h] == s_xfm_cur) {
+            s_xfsrc[i] = (int32_t)s_xfm_pos[h];
+            continue;
+        }
+        s_xfm_gen[h] = s_xfm_cur;
+        s_xfm_key[h] = idx;
+        s_xfm_pos[h] = i;
+        s_xfsrc[i] = -1;
+        s_xfu[nu++] = i;
+    }
+    /* The unique ones, on the pool when there are enough of them. */
+    threads = nu >= XF_MT_MIN && batch_uses_program() ? xf_pool_size() : 1;
+    s_xfp.failed = 0;
+    if (threads > 1)
+        s_xf_pooled += nu;
+    else
+        s_xf_alone += nu;
+    if (threads > 1) {
+        int k, wake = (int)((nu + XF_CHUNK - 1) / XF_CHUNK) - 1;
+        if (wake > threads - 1)
+            wake = threads - 1;
+        s_xfp.done = 0;
+        InterlockedExchange64(&s_xfp.claim, (LONG64)((uint64_t)nu << 32));
+        for (k = 0; k < wake; k++)
+            if (s_xfp.asleep[k])
+                SetEvent(s_xfp.start[k]);
+        xf_unique_claim();
+        while (s_xfp.done < (LONG)nu)            /* chunks still in flight */
+            YieldProcessor();
+        InterlockedExchange64(&s_xfp.claim, 0);  /* closed: count 0 */
+    } else {
+        s_xfp.count = nu;
+        xf_unique_range(0, 1);
+    }
+    if (s_xfp.failed)
+        return 0;                                 /* no program loaded */
+    /* The repeats copy their first use. */
+    for (i = base; i < end; i++) {
+        if (s_xfsrc[i] < 0)
+            continue;
+        s_xf[i] = s_xf[s_xfsrc[i]];
+        s_xf_reused++;
+        if (check) {
+            Nv2aVshOutput t;
+            s_xf_check_n++;
+            if (transform_vertex(s_gpu.idx[i], &t) && memcmp(&t, &s_xf[i], sizeof t)) {
+                if (s_xf_check_bad++ < 16)
+                    fprintf(stderr, "  [XFCHECK] draw %u index %u differs from its "
+                                    "first transform\n", s_gpu.draws, s_gpu.idx[i]);
+            }
+        }
+    }
+    return 1;
+}
+
+/* A batch larger than the memo table goes through it a section at a time; a
+ * vertex repeated across a section boundary is transformed once per section.
+ * These used to run one vertex at a time on this thread -- a quarter of the
+ * driving missions' vertices. A program that writes c[] still runs in order. */
+static int transform_batch(uint32_t n)
+{
+    uint32_t base, i;
+
+    if (nv2a_vsh_writes_constants()) {            /* in order, one at a time */
+        s_xf_inorder += n;
+        for (i = 0; i < n; i++)
+            if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
+                return 0;                         /* no program loaded */
+        return 1;
+    }
+    for (base = 0; base < n; base += XF_MEMO_SIZE / 2)
+        if (!transform_span(base, n - base < XF_MEMO_SIZE / 2 ? n - base : XF_MEMO_SIZE / 2))
+            return 0;
+    return 1;
+}
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
 
     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
         return;
-    for (i = 0; i < n; i++)
-        if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
-            return;                                    /* no program loaded */
+    if (!transform_batch(n))
+        return;
     xf_set_viewport();
     {
         const VertexAttr *tc = texcoord_attr();
@@ -3608,6 +3843,14 @@ static void frame_trace_flip(void)
     }
 }
 
+static int pb_verbose(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
+    return on;
+}
+
 static void draw_primitive(void)
 {
     float v[4];
@@ -3616,7 +3859,10 @@ static void draw_primitive(void)
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
     s_gpu.draws++;
-    if ((s_gpu.draws % 200) == 0)
+    /* RECOMP_PB_EXEC_VERBOSE only: a level draws a few thousand batches a
+     * frame, and a line every 200 on unbuffered stderr was a sixth of the
+     * NV2A thread in Nightfire's main game. Cached: this runs per batch. */
+    if (pb_verbose() && (s_gpu.draws % 200) == 0)
         fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
     s_gpu.verts += s_gpu.idx_count;
 
@@ -3730,7 +3976,7 @@ static void draw_primitive(void)
         }
     }
 
-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+    if (pb_verbose()) {
         static int shown;
         if (shown++ < 6) {
             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
@@ -4199,6 +4445,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      * held 0xFF000000 at times, which put the write outside guest memory). */
     if (subch == 0 && method == 0x1D70 && s_sem_va) {
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+        if (s_backend && s_backend->sync)
+            s_backend->sync();
         *(volatile uint32_t *)(mem + s_sem_va) = param;
         return;
     }
@@ -4415,7 +4663,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                     s_gpu.clear_color, 10);
         clear_surface(param);
-        if (param & 0x01)                         /* Z */
+        /* Z. The rasteriser's depth buffer only, which nothing reads while a
+         * back end draws: 5 MB of stores per clear, several clears a frame. */
+        if ((param & 0x01) && (!backend_draws() || nv2a_backend_shadow()))
             zbuf_clear();
         break;
 
@@ -4976,6 +5226,12 @@ void nv2a_pb_exec_report(void)
     fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
                     " %u triangles dropped behind the eye\n",
             s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind);
+    fprintf(stderr, "[GPU] vertex reuse: %llu transforms saved; XF check %llu compared, "
+                    "%llu differ\n", (unsigned long long)s_xf_reused,
+            (unsigned long long)s_xf_check_n, (unsigned long long)s_xf_check_bad);
+    fprintf(stderr, "[GPU] vertices transformed: %llu on the pool, %llu alone, %llu in order\n",
+            (unsigned long long)s_xf_pooled, (unsigned long long)s_xf_alone,
+            (unsigned long long)s_xf_inorder);
     if (s_gpu.batches_ffp)
         fprintf(stderr, "[GPU] fixed-function transform: %u batches\n",
                 s_gpu.batches_ffp);

@@ -8220,6 +8220,54 @@ static void ke_guest_event_wait_ref(uint32_t guest_va, int delta)
     LeaveCriticalSection(&g_ke_shadow_cs);
 }
 
+/* Software methods a title has said belong to one event. On the console the
+ * NOP's value tells D3D's interrupt handler which event to set; signalling every
+ * title-built event for every value woke waits early. XDK D3D's fence wait
+ * (BlockOnFence) patches NO_OPERATION 5 into the pushbuffer at the fence and
+ * sleeps on the device's pushbuffer-space event; the swap-interval NOP every
+ * present sends (value 1) woke it too, D3D took the fence as passed, and its
+ * pushbuffer writer overwrote commands the GPU had not read yet.
+ *
+ * A bound event is set only by its method, and a bound method sets only its
+ * events. Everything else keeps the old signal-all behaviour. */
+#define SOFTMETHOD_BINDS 8
+static struct { uint32_t method, guest_va; } g_softmethod_bind[SOFTMETHOD_BINDS];
+static int g_softmethod_binds;
+
+void xbox_Nv2aBindSoftwareMethodEvent(uint32_t method, uint32_t guest_va)
+{
+    int i;
+    ke_shadow_init();
+    EnterCriticalSection(&g_ke_shadow_cs);
+    for (i = 0; i < g_softmethod_binds; i++)
+        if (g_softmethod_bind[i].method == method && g_softmethod_bind[i].guest_va == guest_va)
+            break;
+    if (i == g_softmethod_binds && i < SOFTMETHOD_BINDS) {
+        g_softmethod_bind[i].method = method;
+        g_softmethod_bind[i].guest_va = guest_va;
+        g_softmethod_binds++;
+        fprintf(stderr, "  [KERNEL] software method %u sets event 0x%08X only\n",
+                method, guest_va);
+    }
+    LeaveCriticalSection(&g_ke_shadow_cs);
+}
+
+/* Whether software method `method` sets the event at guest_va. */
+static int softmethod_sets(uint32_t method, uint32_t guest_va)
+{
+    int i, bound_method = 0, bound_event = 0;
+    for (i = 0; i < g_softmethod_binds; i++) {
+        if (g_softmethod_bind[i].method == method) {
+            if (g_softmethod_bind[i].guest_va == guest_va)
+                return 1;
+            bound_method = 1;
+        }
+        if (g_softmethod_bind[i].guest_va == guest_va)
+            bound_event = 1;
+    }
+    return !bound_method && !bound_event;
+}
+
 void xbox_Nv2aSignalSoftwareMethod(uint32_t method)
 {
     static unsigned signal_logs;
@@ -8242,7 +8290,7 @@ void xbox_Nv2aSignalSoftwareMethod(uint32_t method)
     int signaled = 0;
     for (uint32_t i = 0; i < KE_SHADOW_SIZE; i++) {
         KE_SHADOW_SLOT *slot = &g_ke_shadow[i];
-        if (slot->in_use == 2) {
+        if (slot->in_use == 2 && softmethod_sets(method, slot->guest_va)) {
             BRIDGE_MEM32(slot->guest_va + 4) = 1;
             SetEvent(slot->host_handle);
             signaled++;

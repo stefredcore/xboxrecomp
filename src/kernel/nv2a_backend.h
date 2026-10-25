@@ -132,6 +132,10 @@ typedef struct {
                   uint32_t flags, uint32_t argb, uint32_t zstencil);
     void (*draw)(const Nv2aSurface *s, const Nv2aBatch *b);
     void (*flip)(void);
+    /* Optional. Called before a semaphore release: whatever the back end has
+     * drawn and keeps back from guest memory has to be there now, because the
+     * title may read it as soon as it sees the release. */
+    void (*sync)(void);
 } Nv2aBackend;
 
 /* Register (or, with NULL, remove) the back end. Call before the title starts

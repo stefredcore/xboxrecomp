@@ -39,6 +39,7 @@ static float    s_const[NV2A_VSH_CONSTANTS][4];
 static uint32_t s_load_slot, s_load_word, s_start_slot;
 static uint32_t s_const_load, s_const_word;
 static uint32_t s_cxt_write;
+static int      s_cxt_writer = -1;       /* program writes c[]; -1 not known yet */
 static int      s_const_trace = -1;      /* RECOMP_VSH_DUMP: constant traffic */
 
 static int vsh_dump_enabled(void)
@@ -63,6 +64,7 @@ void nv2a_vsh_set_load_slot(uint32_t slot)
 
 void nv2a_vsh_program_word(uint32_t word)
 {
+    s_cxt_writer = -1;
     if (s_load_slot < NV2A_VSH_SLOTS)
         s_program[s_load_slot][s_load_word] = word;
     if (++s_load_word == 4) {
@@ -71,7 +73,7 @@ void nv2a_vsh_program_word(uint32_t word)
     }
 }
 
-void nv2a_vsh_set_start_slot(uint32_t slot) { s_start_slot = slot; }
+void nv2a_vsh_set_start_slot(uint32_t slot) { s_start_slot = slot; s_cxt_writer = -1; }
 void nv2a_vsh_set_cxt_write(uint32_t enable) { s_cxt_write = enable; }
 
 void nv2a_vsh_set_constant_load(uint32_t index)
@@ -181,6 +183,32 @@ static void dump_program(uint32_t start)
             break;
     }
     fflush(stderr);
+}
+
+/* Whether the loaded program writes c[]: then each vertex can see what the one
+ * before it wrote, and a caller must run them one at a time, in order. That
+ * takes SET_TRANSFORM_CONSTANT_LOAD's write enable and an instruction that
+ * stores to c[] -- the enable alone, which XDK D3D leaves on, sent a quarter
+ * of the driving missions' vertices down the one-at-a-time path for programs
+ * that never write a constant. */
+int nv2a_vsh_writes_constants(void)
+{
+    if (!s_cxt_write)
+        return 0;
+    if (s_cxt_writer < 0) {
+        uint32_t s;
+        s_cxt_writer = 0;
+        for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
+            const uint32_t *ins = s_program[s];
+            if (field(ins, 3, 12, 4) && !field(ins, 3, 11, 1)) {   /* to c[] */
+                s_cxt_writer = 1;
+                break;
+            }
+            if (field(ins, 3, 0, 1))                               /* final */
+                break;
+        }
+    }
+    return s_cxt_writer;
 }
 
 const float *nv2a_vsh_constant(uint32_t index)

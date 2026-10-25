@@ -14,8 +14,8 @@
  * CPU flipped as fast as the executor could draw (hundreds per second in a
  * simple menu) while its vblank ran at 60. The walker now holds after a
  * FLIP_STALL until the guest's vblank count allows the flip (nv2a_pb_exec.c
- * arms it, the ack loop in xbox_memory_layout.c holds the next walk, the
- * DMA_GET advance and the PFB flush ack).
+ * arms it, the ack loop in xbox_memory_layout.c holds the next walk and the
+ * DMA_GET advance; the PFB flush ack too only with RECOMP_FLIP_HOLD_PFB=1).
  *
  * The rule here is pure: counts and times come in as arguments, so
  * tests/flip_hold drives it without a kernel.

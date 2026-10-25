@@ -25,6 +25,9 @@
 #include <stddef.h>   /* ptrdiff_t */
 #include <stdlib.h>
 #include <string.h>
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -198,6 +201,17 @@ void nv2a_pb_scan_report(void)
 #define PB_PHYS_MASK 0x0FFFFFFCu
 #define PB_RAM_BYTES (64u * 1024u * 1024u)   /* XBOX_CONTIG_SIZE */
 
+#define PB_HIST_PASSES 6
+static uint32_t s_get = 0xFFFFFFFFu, s_ret;
+static int      s_in_call;
+/* Where the current walk started and the PUT it was given, for the desync
+ * report. */
+static uint32_t s_pass_get0, s_pass_put0;
+/* The walks before this one: start, PUT, where each ended, the title's PUT
+ * register when it ended, and whether it ended inside a CALL. */
+static struct { uint32_t g0, p0, end, preg; int call; } s_pass[PB_HIST_PASSES];
+static unsigned s_pass_n;
+
 /* A jump or call outside RAM means the walk is reading data as commands. */
 /* The last command headers decoded, so a desync can be traced back to the
  * command that caused it. */
@@ -223,12 +237,29 @@ static int pb_bad_target(uint32_t w, uint32_t at, uint32_t target, uint32_t put)
         return 0;
     if (++total <= 16 || total % 100 == 0) {
         fprintf(stderr, "  [PB] bad target #%u 0x%08X from word 0x%08X at 0x%08X"
-                        " (PUT 0x%08X); resync\n", total, target, w, at, put);
-        if (total <= 4)
+                        " (PUT 0x%08X; this walk began at 0x%08X for PUT 0x%08X%s); resync\n",
+                        total, target, w, at, put, s_pass_get0, s_pass_put0,
+                        s_in_call ? ", inside a CALL" : "");
+        if (total <= 4) {
+            /* With what memory holds there now: a header that has changed
+             * since the walk read it was rewritten by the title after the walk
+             * passed (a reservation whose length is fixed up later). */
+            const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
             for (k = 0; k < PB_HIST && k < s_hist_n; k++) {
                 unsigned i = (s_hist_n - 1 - k) % PB_HIST;
-                fprintf(stderr, "  [PB]   earlier header 0x%08X at 0x%08X\n",
-                        s_hist[i].w, s_hist[i].at);
+                uint32_t now = s_hist[i].at < PB_RAM_BYTES
+                    ? *(const uint32_t *)(mem + (0x80000000u | s_hist[i].at)) : 0;
+                fprintf(stderr, "  [PB]   earlier header 0x%08X at 0x%08X (now 0x%08X)%s\n",
+                        s_hist[i].w, s_hist[i].at, now, now != s_hist[i].w ? " CHANGED" : "");
+            }
+        }
+        if (total <= 4)
+            for (k = 0; k < PB_HIST_PASSES && k < s_pass_n; k++) {
+                unsigned i = (s_pass_n - 1 - k) % PB_HIST_PASSES;
+                fprintf(stderr, "  [PB]   earlier walk 0x%08X -> PUT 0x%08X ended 0x%08X"
+                                " (PUT register then 0x%08X)%s\n",
+                        s_pass[i].g0, s_pass[i].p0, s_pass[i].end, s_pass[i].preg,
+                        s_pass[i].call ? " in a CALL" : "");
             }
         if (total <= 4)
             for (k = 0; k < PB_HIST && k < s_flow_n; k++) {
@@ -239,8 +270,6 @@ static int pb_bad_target(uint32_t w, uint32_t at, uint32_t target, uint32_t put)
     }
     return 1;
 }
-static uint32_t s_get = 0xFFFFFFFFu, s_ret;
-static int      s_in_call;
 
 /* A method whose parameters the walk has not all reached: the header said
  * `count` words and PUT came first. The DMA engine stalls at PUT and carries
@@ -261,7 +290,42 @@ static int      s_pend_noninc;
  * follows. */
 extern volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset);
 #define NV2A_USER_DMA_GET 0x800044u
+#define NV2A_USER_DMA_PUT 0x800040u
 static uint32_t s_pub = 0xFFFFFFFFu;
+
+/* CACHE1_DMA_SUBROUTINE: the offset a CALL returns to, bit 0 set while the
+ * subroutine runs. Inside a CALL, GET points into the called buffer, outside
+ * the ring, and XDK D3D's free-space code (Nightfire's sub_0016C780) then asks
+ * this register where the GPU will come back to. Left at 0 it answered "below
+ * the ring", D3D counted most of the ring as free and overwrote commands the
+ * walk had not reached: the desyncs in the driving missions. */
+#define NV2A_PFIFO_DMA_SUBROUTINE 0x00324Cu
+static void pb_set_subroutine(uint32_t v)
+{
+    volatile uint32_t *r = xbox_Nv2aRegPtr(NV2A_PFIFO_DMA_SUBROUTINE);
+    if (r)
+        *r = v;
+}
+
+/* Publish GET only if it still holds what the walk last wrote, and return what
+ * it held. The title writes GET too (the ring reset below); a plain read, check
+ * and write could land the walk's GET on top of a reset made in between, and
+ * the walk then carried on past the old lap's end into stale ring contents. */
+static uint32_t pb_publish_get(volatile uint32_t *reg, uint32_t expect, uint32_t val)
+{
+#ifdef _MSC_VER
+    return (uint32_t)_InterlockedCompareExchange((volatile long *)reg, (long)val, (long)expect);
+#else
+    return __sync_val_compare_and_swap(reg, expect, val);
+#endif
+}
+
+/* GET as the walk last published it; the poll thread compares the register
+ * with this to notice a reset made between walks. */
+uint32_t nv2a_pb_walk_get(void)
+{
+    return s_pub;
+}
 
 /* The title moved GET itself: XDK D3D resets the ring by writing DMA_PUT and
  * DMA_GET together (CDevice::KickOff's restart path). Walking on from the old
@@ -273,6 +337,7 @@ void nv2a_pb_resync(uint32_t get_phys)
     pb_flow(s_get, 0xFFFFFFFFu, get_phys & PB_PHYS_MASK);
     s_get = get_phys & PB_PHYS_MASK;
     s_in_call = 0;
+    pb_set_subroutine(s_ret);
     s_pend_left = 0;
     s_pub = s_get;
 }
@@ -313,6 +378,8 @@ void nv2a_pb_scan(uint32_t put_phys)
     }
     if (s_exec_enabled)
         get_reg = xbox_Nv2aRegPtr(NV2A_USER_DMA_GET);
+    s_pass_get0 = s_get;
+    s_pass_put0 = put;
 
     pb_consume(mem, put, &words);             /* the method PUT stalled inside */
 
@@ -321,17 +388,29 @@ void nv2a_pb_scan(uint32_t put_phys)
         uint32_t w;
 
         if (get_reg) {
-            uint32_t g = *get_reg;
+            uint32_t g = pb_publish_get(get_reg, s_pub, s_get);
 
             if (g != s_pub) {                 /* the title moved GET mid-walk */
                 pb_flow(s_get, 0xFFFFFFFFu, g & PB_PHYS_MASK);
                 s_get = g & PB_PHYS_MASK;
                 s_in_call = 0;
+                pb_set_subroutine(s_ret);
                 s_pend_left = 0;
                 s_pub = s_get;
+                /* XDK D3D resets the ring by writing GET and PUT together, so
+                 * the PUT this walk started with belongs to the old lap: from
+                 * the new GET it lies somewhere past what the title has written
+                 * since, and walking up to it read stale ring contents as
+                 * commands (Nightfire's driving missions desynchronised a dozen
+                 * times a run and could lose a fence release for good). The DMA
+                 * engine compares against the PUT register as it is now. */
+                {
+                    volatile uint32_t *put_reg = xbox_Nv2aRegPtr(NV2A_USER_DMA_PUT);
+                    if (put_reg)
+                        put = *put_reg & PB_PHYS_MASK;
+                }
                 continue;
             }
-            *get_reg = s_get;
             s_pub = s_get;
         }
         at = s_get;
@@ -379,11 +458,13 @@ void nv2a_pb_scan(uint32_t put_phys)
                  * the pusher. Taking it would overwrite the return address
                  * and send the first RETURN to the wrong place. */
                 s_in_call = 0;
+                pb_set_subroutine(s_ret);
                 s_get = put, s_pend_left = 0;
                 break;
             }
             s_ret = s_get;
             s_in_call = 1;
+            pb_set_subroutine(s_ret | 1u);    /* before GET moves into it */
             s_tot_calls++;
             pb_flow(at, w, target);
             s_get = target;
@@ -394,6 +475,7 @@ void nv2a_pb_scan(uint32_t put_phys)
                 pb_flow(at, w, s_ret);
                 s_get = s_ret;
                 s_in_call = 0;
+                pb_set_subroutine(s_ret);
             }
             continue;
         }
@@ -420,14 +502,21 @@ void nv2a_pb_scan(uint32_t put_phys)
         unknown++;
     }
 
-    if (get_reg) {                            /* what the poll thread writes too */
-        *get_reg = s_get;
-        s_pub = s_get;
-    }
+    if (get_reg && pb_publish_get(get_reg, s_pub, s_get) == s_pub)
+        s_pub = s_get;                        /* else the title reset it: next walk */
     s_tot_words += words;
     s_tot_unknown += unknown;
     s_tot_jumps += jumps;
     s_tot_segments++;
+    {
+        volatile uint32_t *pr = xbox_Nv2aRegPtr(NV2A_USER_DMA_PUT);
+        unsigned i = s_pass_n++ % PB_HIST_PASSES;
+        s_pass[i].g0 = s_pass_get0;
+        s_pass[i].p0 = s_pass_put0;
+        s_pass[i].end = s_get;
+        s_pass[i].preg = pr ? *pr : 0;
+        s_pass[i].call = s_in_call;
+    }
 }
 
 /* RECOMP_PB_WALK=dma selects the DMA-engine walk above. The default is the
