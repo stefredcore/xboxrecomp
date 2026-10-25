@@ -556,6 +556,45 @@ static void pad_script_apply(int pad, uint8_t *out)
     }
 }
 
+/* RECOMP_INPUT_LOG=1: every change the title can see in a pad's report, as
+ * it goes out -- after the host pad, the keyboard, synthetic presses and the
+ * pad script have all been merged in, so whichever of them produced it, it
+ * is here. Buttons and analog buttons on any change; a stick when it moves
+ * more than 4000 (of 32767) from where it was last logged, so a resting
+ * stick's noise does not fill the log while a push still shows. A cutscene
+ * that ends as if skipped either has a line here just before the next video
+ * opens, or the input is not what ended it. */
+static void input_log(int pad, const uint8_t *out)
+{
+    static int on = -1;
+    static uint8_t last[4][12];
+    static int16_t last_ax[4][4];
+    static DWORD t0;
+    int16_t ax[4];
+    int i, moved = 0;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_INPUT_LOG");
+        on = e && *e && *e != '0';
+        t0 = GetTickCount();
+    }
+    if (!on || pad < 0 || pad > 3)
+        return;
+    memcpy(ax, &out[12], sizeof ax);
+    for (i = 0; i < 4; i++)
+        if (abs(ax[i] - last_ax[pad][i]) > 4000)
+            moved = 1;
+    if (!moved && !memcmp(last[pad] + 2, out + 2, 10))
+        return;
+    memcpy(last[pad] + 2, out + 2, 10);
+    memcpy(last_ax[pad], ax, sizeof ax);
+    fprintf(stderr, "  [INPUT] t=%lu ms pad %d buttons %02X%02X analog %02X %02X %02X %02X"
+                    " %02X %02X LT %02X RT %02X  L %6d %6d  R %6d %6d\n",
+            (unsigned long)(GetTickCount() - t0), pad, out[3], out[2],
+            out[4], out[5], out[6], out[7], out[8], out[9], out[10], out[11],
+            ax[0], ax[1], ax[2], ax[3]);
+}
+
 int usb_gamepad_report(int pad, uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;
@@ -611,6 +650,7 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     if (xbox_InputGetState((DWORD)pad, &state) != 0) {
         out[2] = synth;
         pad_script_apply(pad, out);
+        input_log(pad, out);
         return 20;
     }
 
@@ -628,5 +668,6 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     out[18] = (uint8_t)(g->sThumbRY & 0xFF);
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
     pad_script_apply(pad, out);
+    input_log(pad, out);
     return 20;
 }
