@@ -210,8 +210,8 @@ uint32_t xbox_ContiguousAllocatedBytes(void);
 /* One byte per 4 KB page of the window, nonzero while the page is allocated
  * (or claimed). Read without the arena lock; a device model's view. */
 const volatile uint8_t *xbox_ContiguousPageMap(void);
-/* MmGetPhysicalAddress named this VA; recorded if it is a heap page below
- * 64 MB (the image and stacks are not recorded). */
+/* MmGetPhysicalAddress named this VA; recorded if it is a heap or image page
+ * below 64 MB (stacks are not recorded). */
 void xbox_PhysNoteRamName(uint32_t va);
 /* One byte per 4 KB physical page below 64 MB, nonzero while the title holds
  * a RAM name for a heap page there (see xbox_PhysNoteRamName); cleared when

@@ -4486,6 +4486,15 @@ void xbox_PhysNoteRamName(uint32_t va)
 {
     if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE)
         g_phys_ram_named[va / CONTIG_PAGE] = 1;
+    /* The image too. XDK DirectSound plays four silent voices off a 64-byte
+     * zero buffer in its own DSOUND section (Nightfire: 0x0011C7AA) and puts
+     * MmGetPhysicalAddress's answer in their SGE list. That page number was
+     * also a window page -- D3D's pushbuffer block -- and the APU read the
+     * window: graphics data as PCM, a loud tone locked to the 32-sample frame
+     * (1500 Hz and its harmonics). Image pages are never freed, so nothing
+     * clears these. */
+    else if (va >= g_xbox_image_lo && va < g_xbox_image_hi && va < XBOX_CONTIG_SIZE)
+        g_phys_ram_named[va / CONTIG_PAGE] = 1;
 }
 
 /* Heap block m is free (and merged with any free neighbours): its pages name

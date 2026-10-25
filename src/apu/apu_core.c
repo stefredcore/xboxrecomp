@@ -111,8 +111,10 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
      * window page. A title that loads its effect banks and music stream into
      * the heap puts those physical numbers in the voices' SGE lists; read
      * from the window, effects played whatever the window held there (white
-     * noise) and the stream played zeros. Only heap pages are recorded, so
-     * the voice-array case below still holds for the image. */
+     * noise) and the stream played zeros. Image pages are recorded the same
+     * way (a buffer in DirectSound's own section, xbox_PhysNoteRamName); the
+     * voice-array case below, a window page named through its window VA,
+     * is not recorded and still resolves to the window. */
     if (xbox_PhysRamNameMap()[a >> 12])
         return g_apu_ram_ptr + a;
     /* A page the contiguous allocator handed out is the window, even where
@@ -512,10 +514,17 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     d->monitor.queued_bytes_high = 3072;
 
     /* RECOMP_AUDIO_WAV=<path>: dump exactly what the device is given,
-     * capped at RECOMP_AUDIO_WAV_SECS seconds when that is set. */
+     * capped at RECOMP_AUDIO_WAV_SECS seconds when that is set. A "%u" in
+     * the path becomes the process id: a title that launches another XBE
+     * hands its environment on, and both images would write one file. */
     {
         const char *wav = getenv("RECOMP_AUDIO_WAV");
         const char *secs = getenv("RECOMP_AUDIO_WAV_SECS");
+        char path[600];
+        if (wav && *wav && strstr(wav, "%u")) {
+            snprintf(path, sizeof path, wav, (unsigned)GetCurrentProcessId());
+            wav = path;
+        }
         if (wav && *wav)
             apu_wav_open(wav, secs ? atof(secs) : 0.0);
     }
