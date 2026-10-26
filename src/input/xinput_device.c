@@ -33,6 +33,12 @@ static void keyboard_merge(XBOX_INPUT_STATE *pState)
     XBOX_INPUT_STATE kb;
     int i;
 
+#if defined(_WIN32)
+    /* RECOMP_MKB has its own key layout; this map would give the same keys
+     * a second meaning. */
+    if (mkb_enabled())
+        return;
+#endif
     if (!xbox_InputKeyboardPoll(&kb))
         return;
     pState->Gamepad.wButtons |= kb.Gamepad.wButtons;
@@ -85,9 +91,12 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         if (dwPort == 0) {
             /* Keyboard and mouse stand in for an absent pad, so the game is
              * playable with no controller plugged in. */
-            int kb;
+            int kb = 0;
             memset(pState, 0, sizeof *pState);
-            kb = xbox_InputKeyboardPoll(pState);
+            /* RECOMP_MKB has its own key layout; the keyboard map would
+             * give the same keys a second meaning. */
+            if (!mkb_enabled())
+                kb = xbox_InputKeyboardPoll(pState);
             if (mkb_merge(dwPort, pState))
                 g_controller_connected[dwPort] = TRUE;
             if (kb || mkb_enabled())
