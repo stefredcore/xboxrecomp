@@ -1109,6 +1109,9 @@ NTSTATUS __stdcall xbox_HalWriteSMBusValue(UCHAR SlaveAddress, UCHAR CommandCode
 VOID    __stdcall xbox_HalRegisterShutdownNotification(PVOID ShutdownRegistration, BOOLEAN Register);
 VOID       __stdcall xbox_DbgBreakPoint(void);
 ULONGLONG  __stdcall xbox_KeQueryInterruptTime(void);
+/* Milliseconds on GetTickCount64's scale, in 1 ms steps (the console's clock
+ * interrupt) rather than the host's 15.6 ms: KeTickCount, interrupt time. */
+ULONGLONG  xbox_HostTickMs(void);
 BOOLEAN __stdcall xbox_KeDisconnectInterrupt(PXBOX_KINTERRUPT Interrupt);
 
 /* HAL data exports -- ordinals 40/41/42 and 356/357 are variables, not calls. */

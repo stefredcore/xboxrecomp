@@ -1048,10 +1048,45 @@ KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 
 volatile ULONG xbox_KeTickCount = 0;
 
+/* The console's clock interrupt comes every millisecond, and KeTickCount and
+ * the interrupt time move with it. GetTickCount and GetTickCount64 move in
+ * steps of about 15.6 ms, the host's scheduler tick, whatever the timer
+ * resolution: a title that paces its frames on either saw time stand still
+ * for 15 ms and then jump, and in Nightfire's driving missions -- once the
+ * GPU no longer held the game back -- its frames came 12 to 28 ms apart
+ * instead of 20. This is GetTickCount64's value and scale, advanced by the
+ * performance counter, a millisecond at a time. */
+static LONGLONG s_tick_anchor_ms, s_tick_anchor_counts, s_tick_freq;
+static INIT_ONCE s_tick_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK anchor_tick(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    LARGE_INTEGER f, now;
+    (void)once; (void)param; (void)ctx;
+    QueryPerformanceFrequency(&f);
+    s_tick_freq = f.QuadPart ? f.QuadPart : 1;
+    s_tick_anchor_ms = (LONGLONG)GetTickCount64();
+    QueryPerformanceCounter(&now);
+    s_tick_anchor_counts = now.QuadPart;
+    return TRUE;
+}
+
+ULONGLONG xbox_HostTickMs(void)
+{
+    LARGE_INTEGER now;
+    LONGLONG d;
+
+    InitOnceExecuteOnce(&s_tick_once, anchor_tick, NULL, NULL);
+    QueryPerformanceCounter(&now);
+    d = now.QuadPart - s_tick_anchor_counts;
+    return (ULONGLONG)(s_tick_anchor_ms + (d / s_tick_freq) * 1000
+                       + (d % s_tick_freq) * 1000 / s_tick_freq);
+}
+
 /* Call this periodically or on-demand to update KeTickCount */
 static void xbox_update_tick_count(void)
 {
-    xbox_KeTickCount = GetTickCount();
+    xbox_KeTickCount = (ULONG)xbox_HostTickMs();
 }
 
 /* ============================================================================
@@ -1752,11 +1787,11 @@ VOID __stdcall xbox_DbgBreakPoint(void)
 ULONGLONG __stdcall xbox_KeQueryInterruptTime(void)
 {
     /*
-     * Time since boot in NT 100ns units. GetTickCount64 is milliseconds, so
-     * scale by 10,000. Resolution is coarser than the real kernel's, but it is
-     * monotonic, which is the property callers actually depend on.
+     * Time since boot in NT 100ns units, a millisecond at a time as the
+     * console's clock interrupt advances it (xbox_HostTickMs; GetTickCount64
+     * alone moved in 15.6 ms steps).
      */
-    return (ULONGLONG)GetTickCount64() * 10000ULL;
+    return xbox_HostTickMs() * 10000ULL;
 }
 
 /* ============================================================================
