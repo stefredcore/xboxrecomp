@@ -56,6 +56,15 @@ static const char *const k_wheel_names[WHEEL_KINDS] = {
     "wheelup", "wheeldown", "aim+wheelup", "aim+wheeldown"
 };
 
+/* A title action ("+forward = w, up"): keys a title hook asks about by
+ * name with mkb_action(), past the pad and its control scheme. */
+#define MKB_ACTIONS 32
+typedef struct {
+    char    name[24];   /* without the '+' */
+    uint8_t key[INPUT_BINDINGS_PER_CONTROL];
+    uint8_t count;
+} MkbAction;
+
 typedef struct {
     double sens;        /* multiplier on the aim deflection          */
     double dz;          /* assumed game deadzone, 0..1               */
@@ -70,6 +79,8 @@ typedef struct {
     double m_yaw, m_pitch; /* degrees per count at sensitivity 1     */
     InputBindings keys;
     uint32_t wheel[WHEEL_KINDS];   /* bit per InputControl */
+    MkbAction action[MKB_ACTIONS];
+    int    actions;
 } MkbConfig;
 
 static MkbConfig s_cfg;
@@ -141,6 +152,48 @@ static int bind_control(int control, const char *text)
     return bad > 0 ? bad : 0;
 }
 
+/* "+name = keys": the action's keys, replacing what it had. Returns the
+ * names that are not keys, or -1 when the table is full. */
+static int bind_action(const char *name, const char *text)
+{
+    MkbAction *a = NULL;
+    char tok[48];
+    const char *p = text;
+    int i, bad = 0;
+
+    for (i = 0; i < s_cfg.actions; i++)
+        if (!_stricmp(s_cfg.action[i].name, name))
+            a = &s_cfg.action[i];
+    if (!a) {
+        if (s_cfg.actions == MKB_ACTIONS || strlen(name) >= sizeof a->name)
+            return -1;
+        a = &s_cfg.action[s_cfg.actions++];
+        strcpy(a->name, name);
+    }
+    a->count = 0;
+    while (*p) {
+        const char *e = strchr(p, ',');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        size_t b0 = 0, b1 = n;
+        while (b0 < b1 && (p[b0] == ' ' || p[b0] == '\t')) b0++;
+        while (b1 > b0 && (p[b1 - 1] == ' ' || p[b1 - 1] == '\t')) b1--;
+        if (b1 > b0 && b1 - b0 < sizeof tok) {
+            int vk;
+            memcpy(tok, p + b0, b1 - b0);
+            tok[b1 - b0] = 0;
+            vk = xbox_InputMap_KeyFromName(tok);
+            if (vk > 0 && vk < 256 && a->count < INPUT_BINDINGS_PER_CONTROL)
+                a->key[a->count++] = (uint8_t)vk;
+            else if (_stricmp(tok, "none"))
+                bad++;
+        }
+        if (!e)
+            break;
+        p = e + 1;
+    }
+    return bad;
+}
+
 /* One "key = value" line; returns 1 when the key was recognised. */
 static int mkb_apply_kv(const char *key, const char *val)
 {
@@ -175,6 +228,11 @@ static int mkb_apply_kv(const char *key, const char *val)
     } else if (!_stricmp(key, "diagonal")) {
         s_cfg.keys.diagonal = !_stricmp(val, "full") ? INPUT_DIAGONAL_FULL
                                                      : INPUT_DIAGONAL_ROUND;
+    } else if (key[0] == '+' && key[1]) {
+        int bad = bind_action(key + 1, val);
+        if (bad)
+            fprintf(stderr, "  [MKB] %s: %s \"%s\"\n", key,
+                    bad < 0 ? "too many actions, dropped" : "names not understood in", val);
     } else if ((c = xbox_InputMap_ControlFromName(key)) >= 0) {
         int bad = bind_control(c, val);
         if (bad)
@@ -514,11 +572,12 @@ static int game_is_foreground(void)
  * the same physical movement, so it would wander across the screen and
  * end up clicking other apps' title bars. ShowCursor() only counts for
  * the calling thread, and the game's windows belong to another one, so
- * the pointer goes through the window's class cursor instead: none while
- * captured, the old one back on release. */
+ * the pointer goes through the window's class cursor instead: a blank one
+ * while captured, the old one back on release. (A NULL class cursor would
+ * not do: Windows then leaves the pointer as it was.) */
 static void mkb_manage_cursor(int capture)
 {
-    static HWND hidden;          /* window whose class cursor we cleared */
+    static HWND hidden;          /* window whose class cursor we blanked */
     static HCURSOR old;
     static unsigned long last;
 
@@ -535,10 +594,18 @@ static void mkb_manage_cursor(int capture)
         ClipCursor(NULL);
     }
     if (fg) {
+        static HCURSOR blank;
         RECT r;
-        if (!hidden) {
+        if (!blank) {
+            BYTE and_mask[32 * 32 / 8], xor_mask[32 * 32 / 8];
+            memset(and_mask, 0xFF, sizeof and_mask);   /* keep the screen */
+            memset(xor_mask, 0x00, sizeof xor_mask);   /* and draw nothing */
+            blank = CreateCursor(GetModuleHandleA(NULL), 0, 0, 32, 32,
+                                 and_mask, xor_mask);
+        }
+        if (!hidden && blank) {
             old = (HCURSOR)GetClassLongPtrA(fg, GCLP_HCURSOR);
-            SetClassLongPtrA(fg, GCLP_HCURSOR, 0);
+            SetClassLongPtrA(fg, GCLP_HCURSOR, (LONG_PTR)blank);
             hidden = fg;
             /* The class cursor shows at the next move; nudge it now. */
             {
@@ -675,6 +742,26 @@ int mkb_mouse_look(double *yaw_deg, double *pitch_deg)
     if (s_cfg.invert_y)
         *pitch_deg = -*pitch_deg;
     return 1;
+}
+
+int mkb_action(const char *name)
+{
+    int i, k;
+
+    if (!name || !mkb_enabled() || !InterlockedCompareExchange(&s_active, 0, 0))
+        return 0;
+    if (*name == '+')
+        name++;
+    for (i = 0; i < s_cfg.actions; i++) {
+        const MkbAction *a = &s_cfg.action[i];
+        if (_stricmp(a->name, name))
+            continue;
+        for (k = 0; k < a->count; k++)
+            if (s_vk_down[a->key[k]])
+                return game_is_foreground();
+        return 0;
+    }
+    return 0;
 }
 
 int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)

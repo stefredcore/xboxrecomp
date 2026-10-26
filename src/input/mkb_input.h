@@ -84,6 +84,19 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState);
  */
 int mkb_mouse_look(double *yaw_deg, double *pitch_deg);
 
+/*
+ * Title actions: an mkb.ini line "+name = keys" (up to four, as for a pad
+ * control; the PC versions' names read best: +forward, +moveleft, ...)
+ * gives a key list a title hook asks about by name, for input the title
+ * takes past its pad and control scheme -- moving with WASD whichever
+ * stick the player's scheme gives that job. Keys bound to an action are
+ * usually left off the pad controls.
+ *
+ * Returns 1 while one of the action's keys is held, the layer captured
+ * and the game in the foreground; 0 otherwise, and for an unknown name.
+ */
+int mkb_action(const char *name);
+
 #ifdef __cplusplus
 }
 #endif
