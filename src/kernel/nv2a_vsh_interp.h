@@ -64,4 +64,14 @@ int nv2a_vsh_writes_constants(void);
 void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word);
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4]);
 
+/* For a back end that runs the program itself (nv2a_backend.h,
+ * Nv2aProgramBatch). The loaded program from the start slot through its final
+ * instruction: the count, 0 if no instruction within program memory is final
+ * (nv2a_vsh_run would refuse it too). */
+uint32_t nv2a_vsh_program(const uint32_t (**words)[4]);
+/* The inputs that program reads: bit n for v<n>. */
+uint32_t nv2a_vsh_input_mask(void);
+/* c[0..NV2A_VSH_CONSTANTS-1] as they stand. */
+const float (*nv2a_vsh_constants(void))[4];
+
 #endif

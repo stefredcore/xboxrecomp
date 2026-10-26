@@ -3588,10 +3588,195 @@ static int transform_batch(uint32_t n)
     return 1;
 }
 
+/* Vertex programs on the back end (NV2A_BACKEND_CAP_PROGRAM).
+ *
+ * On the console the vertex unit runs the program; here it ran on the CPU,
+ * vertex by vertex, and that interpreter with the clipping and triangle setup
+ * around it was a quarter of the NV2A thread in the driving missions. A back
+ * end that asks for it gets the batch as the vertex unit would: the inputs the
+ * program reads, each vertex once, a triangle list over them, the program and
+ * the constants. The batches that keep the CPU path: shadow mode (its point
+ * is the CPU's frame), a program that writes c[] (each vertex sees the one
+ * before), and batches drawn without the register combiners (the back end's
+ * simple path takes surface pixels). RECOMP_GPU_VSH=0 keeps the CPU for all. */
+static int program_on_backend(void)
+{
+    static int on = -1, no_rc = -1;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GPU_VSH");
+        on = !(e && e[0] == '0');
+        no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
+    }
+    return on && backend_draws() && (s_backend->caps & NV2A_BACKEND_CAP_PROGRAM)
+        && !nv2a_backend_shadow() && batch_uses_program() && s_gpu.rc_seen && !no_rc
+        && !nv2a_vsh_writes_constants()
+        && (surface_bpp() == 4 || surface_bpp() == 2);
+}
+
+#define PB_SLOT_TABLE (NV_MAX_INDICES * 2)            /* power of two */
+static uint32_t s_pb_key[PB_SLOT_TABLE], s_pb_val[PB_SLOT_TABLE], s_pb_gen[PB_SLOT_TABLE];
+static uint32_t s_pb_cur;
+static uint32_t s_pb_slot[NV_MAX_INDICES];            /* position -> vertex */
+static uint32_t s_pb_tri[NV_MAX_INDICES * 3];
+static float   *s_pb_in;
+static size_t   s_pb_in_cap;
+
+/* One vertex's inputs, packed as Nv2aProgramBatch.inputs wants them: what
+ * transform_vertex hands nv2a_vsh_run, only the inputs the program reads. */
+static void program_fetch(uint32_t index, uint32_t mask, float *out)
+{
+    uint32_t a;
+
+    for (a = 0; a < NV2A_VSH_INPUTS; a++) {
+        if (!((mask >> a) & 1))
+            continue;
+        if (!s_gpu.attr[a].size && a < NV_VERTEX_ATTRS)
+            memcpy(out, s_gpu.imm_attr[a], 4 * sizeof(float));
+        else
+            fetch_attr(&s_gpu.attr[a], index, out);
+        out += 4;
+    }
+}
+
+/* The batch as an Nv2aProgramBatch, drawn by the back end. 0 if the program
+ * cannot run (no final instruction): the CPU path then refuses it as well. */
+static int draw_program_batch(void)
+{
+    static int near_z = -1;
+    const uint32_t (*words)[4];
+    uint32_t n = s_gpu.idx_count, len, mask, stride = 0, nv = 0, nt = 0, i;
+    Nv2aProgramBatch pb;
+    Nv2aSurface surf;
+    Nv2aRenderState rs;
+    Nv2aTexture tex;
+    Nv2aBatch batch;
+    float fc[4];
+    int st;
+
+    if (!(len = nv2a_vsh_program(&words)))
+        return 0;
+    if (near_z < 0) {
+        const char *e = getenv("RECOMP_CLIP_NEAR_Z");
+        near_z = !(e && e[0] == '0');
+    }
+    mask = nv2a_vsh_input_mask();
+    for (i = 0; i < NV2A_VSH_INPUTS; i++)
+        stride += (mask >> i) & 1;
+
+    /* Each vertex index once; s_pb_slot maps a position to its vertex. */
+    if (++s_pb_cur == 0) {
+        memset(s_pb_gen, 0, sizeof s_pb_gen);
+        s_pb_cur = 1;
+    }
+    if ((size_t)n * stride * 4 > s_pb_in_cap) {
+        size_t cap = (size_t)n * stride * 4 * 2;
+        float *p = (float *)realloc(s_pb_in, cap * sizeof(float));
+        if (!p)
+            return 0;
+        s_pb_in = p;
+        s_pb_in_cap = cap;
+    }
+    for (i = 0; i < n; i++) {
+        uint32_t idx = s_gpu.idx[i];
+        uint32_t h = (idx * 2654435761u) & (PB_SLOT_TABLE - 1);
+        while (s_pb_gen[h] == s_pb_cur && s_pb_key[h] != idx)
+            h = (h + 1) & (PB_SLOT_TABLE - 1);
+        if (s_pb_gen[h] != s_pb_cur) {
+            s_pb_gen[h] = s_pb_cur;
+            s_pb_key[h] = idx;
+            s_pb_val[h] = nv;
+            program_fetch(idx, mask, s_pb_in + (size_t)nv * stride * 4);
+            nv++;
+        }
+        s_pb_slot[i] = s_pb_val[h];
+    }
+
+    /* Triangles, in raster_batch_program's order. */
+#define PB_TRI(a, b, c) (s_pb_tri[nt++] = s_pb_slot[a], s_pb_tri[nt++] = s_pb_slot[b], \
+                         s_pb_tri[nt++] = s_pb_slot[c])
+    switch (s_gpu.prim) {
+    case NV_PRIM_TRIANGLES:
+        for (i = 0; i + 2 < n; i += 3) PB_TRI(i, i + 1, i + 2);
+        break;
+    case NV_PRIM_TRIANGLE_STRIP:
+        for (i = 0; i + 2 < n; i++) PB_TRI(i, i + 1, i + 2);
+        break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:
+        for (i = 1; i + 1 < n; i++) PB_TRI(0, i, i + 1);
+        break;
+    case NV_PRIM_QUADS:
+        for (i = 0; i + 3 < n; i += 4) { PB_TRI(i, i + 1, i + 2); PB_TRI(i, i + 2, i + 3); }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        for (i = 0; i + 3 < n; i += 2) { PB_TRI(i, i + 1, i + 3); PB_TRI(i, i + 3, i + 2); }
+        break;
+    default:
+        break;
+    }
+#undef PB_TRI
+    if (!nt)
+        return 1;
+
+    xf_set_viewport();
+    memset(&pb, 0, sizeof pb);
+    pb.program = words;
+    pb.length = len;
+    pb.constants = nv2a_vsh_constants();
+    pb.input_mask = mask;
+    pb.inputs = s_pb_in;
+    pb.vertex_count = nv;
+    pb.indices = s_pb_tri;
+    pb.index_count = nt;
+    pb.aa_sx = s_gpu.aa_sx;
+    pb.aa_sy = s_gpu.aa_sy;
+    pb.near_z = s_xf_o[2];
+    pb.clip_near_z = (uint32_t)near_z;
+    pb.fog_enable = (uint32_t)s_gpu.fog_enable;
+    pb.fog_mode = s_gpu.fog_mode;
+    pb.fog_param[0] = s_gpu.fog_param[0];
+    pb.fog_param[1] = s_gpu.fog_param[1];
+
+    /* The rest as backend_flush hands over a combiner batch. */
+    current_surface(&surf);
+    current_render_state(&rs);
+    memset(&batch, 0, sizeof batch);
+    batch.state = &rs;
+    if (s_gpu.texs[0].valid) {
+        backend_texture(&s_gpu.texs[0], &tex);
+        batch.texture = &tex;
+    }
+    batch.combiner = &s_gpu.rc;
+    for (st = 0; st < 4; st++)
+        if (s_gpu.texs[st].valid) {
+            backend_texture(&s_gpu.texs[st], &batch.stage[st]);
+            batch.stage_valid |= 1u << st;
+        }
+    nv2a_rc_unpack(s_gpu.fog_color, fc);   /* R in bits 0-7, as backend_flush */
+    batch.fog_color[0] = fc[2];
+    batch.fog_color[1] = fc[1];
+    batch.fog_color[2] = fc[0];
+    batch.fog_color[3] = 0.0f;
+    batch.clip_plane_mode = s_gpu.clip_plane_mode;
+    batch.program = &pb;
+    s_backend->draw(&surf, &batch);
+
+    s_gpu.batches_program++;
+    s_gpu.verts_program += n;
+    s_gpu.tris_drawn += nt / 3;
+    if (s_gpu.texs[0].valid)
+        note_texture_use();
+    note_drawn();
+    return 1;
+}
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
 
+    if (program_on_backend() && draw_program_batch())
+        return;
     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
         return;
     if (!transform_batch(n))

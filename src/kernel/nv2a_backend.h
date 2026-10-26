@@ -17,8 +17,10 @@
  * Fixed-function, pre-transformed and vertex-program batches all arrive the
  * same way: the executor transforms fixed-function vertices itself, runs
  * vertex programs on the CPU (nv2a_vsh_interp.c) and clips at the near plane,
- * so a back end only ever sees surface pixels. Blend, depth, alpha, cull and
- * stencil state arrive in Nv2aRenderState.
+ * so a back end only ever sees surface pixels -- unless the back end asks for
+ * vertex programs (NV2A_BACKEND_CAP_PROGRAM), which then arrive untransformed
+ * for it to run, as the NV2A's own vertex unit does. Blend, depth, alpha, cull
+ * and stencil state arrive in Nv2aRenderState.
  *
  * ponytail: register-combiner state and texture stages 1-3 are not passed on:
  * a back end sees stage 0 and the diffuse colour. Extend Nv2aBatch when that
@@ -124,6 +126,34 @@ typedef struct {
     float tc[4][4];                 /* texture stage coordinates s,t,r,q */
 } Nv2aVertexFull;
 
+/* A vertex-program batch, for a back end that runs the program itself
+ * (NV2A_BACKEND_CAP_PROGRAM). Nothing is transformed or clipped on the CPU:
+ * the back end gets what the vertex unit would. Per vertex it must do what
+ * the executor does with nv2a_vsh_run's output (nv2a_pb_exec.c,
+ * transform_vertex and the near-plane clip): oPos.w of +0 reads as 1; x, y
+ * times aa_sx, aa_sy; clip at w = 1e-3 and, with clip_near_z, at screen
+ * z = near_z; the fog factor from oFog.x by fog_mode and fog_param, as
+ * fog_factor. Sent only for batches that would go through the register
+ * combiners (Nv2aBatch.full), never in shadow mode, and never for a program
+ * that writes c[] (each vertex would see the one before). */
+typedef struct {
+    const uint32_t (*program)[4];   /* from the start slot */
+    uint32_t       length;          /* instructions, the last one final */
+    const float  (*constants)[4];   /* c[0..191] */
+    uint32_t       input_mask;      /* v<n> the program reads */
+    /* Per vertex, one float4 per bit of input_mask, lowest input first:
+     * vertex_count * popcount(input_mask) float4s. */
+    const float   *inputs;
+    uint32_t       vertex_count;
+    const uint32_t *indices;        /* triangle list into the vertices */
+    uint32_t       index_count;
+    float          aa_sx, aa_sy;
+    float          near_z;          /* SET_CLIP_MIN, or 0 (see xf_set_viewport) */
+    uint32_t       clip_near_z;
+    uint32_t       fog_enable, fog_mode;
+    float          fog_param[2];
+} Nv2aProgramBatch;
+
 typedef struct {
     const Nv2aVertex  *vertices;    /* triangle list: count is a multiple of 3 */
     uint32_t           count;
@@ -139,7 +169,12 @@ typedef struct {
     uint32_t              stage_valid;
     float                 fog_color[4];      /* r,g,b of SET_FOG_COLOR, a 0 */
     uint32_t              clip_plane_mode;   /* SET_SHADER_CLIP_PLANE_MODE */
+
+    /* Set instead of vertices/full (both NULL, count 0) for a back end with
+     * NV2A_BACKEND_CAP_PROGRAM: combiner, stage and fog fields as for full. */
+    const Nv2aProgramBatch *program;
 } Nv2aBatch;
+#define NV2A_BACKEND_HAS_PROGRAM 1   /* Nv2aBatch.program, Nv2aBackend.caps */
 
 typedef struct {
     /* flags: CLEAR_SURFACE bits (Z 0x1, stencil 0x2, colour 0xF0).
@@ -152,7 +187,12 @@ typedef struct {
      * drawn and keeps back from guest memory has to be there now, because the
      * title may read it as soon as it sees the release. */
     void (*sync)(void);
+    /* NV2A_BACKEND_CAP_* the back end handles; 0 for none. */
+    uint32_t caps;
 } Nv2aBackend;
+
+/* Vertex-program batches arrive untransformed (Nv2aProgramBatch). */
+#define NV2A_BACKEND_CAP_PROGRAM 0x1u
 
 /* Register (or, with NULL, remove) the back end. Call before the title starts
  * submitting work; the executor must also be enabled (RECOMP_PB_EXEC). */

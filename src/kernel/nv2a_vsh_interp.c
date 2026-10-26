@@ -231,6 +231,38 @@ void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word)
         memcpy(&s_const[index][comp], &word, 4);
 }
 
+uint32_t nv2a_vsh_program(const uint32_t (**words)[4])
+{
+    uint32_t s;
+
+    *words = (const uint32_t (*)[4])s_program[s_start_slot < NV2A_VSH_SLOTS ? s_start_slot : 0];
+    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++)
+        if (field(s_program[s], 3, 0, 1))
+            return s - s_start_slot + 1;
+    return 0;
+}
+
+/* A, B and C share one input index (dword 1); any of them with mux 2 reads it. */
+uint32_t nv2a_vsh_input_mask(void)
+{
+    uint32_t s, mask = 0;
+
+    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
+        const uint32_t *ins = s_program[s];
+        if (field(ins, 2, 26, 2) == 2 || field(ins, 2, 11, 2) == 2
+                || field(ins, 3, 28, 2) == 2)
+            mask |= 1u << field(ins, 1, 9, 4);
+        if (field(ins, 3, 0, 1))
+            break;
+    }
+    return mask;
+}
+
+const float (*nv2a_vsh_constants(void))[4]
+{
+    return (const float (*)[4])s_const;
+}
+
 /* ---- execution ----------------------------------------------------------- */
 
 typedef struct { float v[4]; } vec4;
