@@ -512,26 +512,43 @@ static int game_is_foreground(void)
 /* Hide and confine the pointer while captured. Aiming with raw deltas
  * does not move the pointer by itself, but Windows still moves it from
  * the same physical movement, so it would wander across the screen and
- * end up clicking other apps' title bars. */
+ * end up clicking other apps' title bars. ShowCursor() only counts for
+ * the calling thread, and the game's windows belong to another one, so
+ * the pointer goes through the window's class cursor instead: none while
+ * captured, the old one back on release. */
 static void mkb_manage_cursor(int capture)
 {
-    static int hidden;          /* how many ShowCursor(FALSE) we owe  */
+    static HWND hidden;          /* window whose class cursor we cleared */
+    static HCURSOR old;
     static unsigned long last;
 
     unsigned long now = GetTickCount();
-    if (now - last < 500 && (capture ? hidden : !hidden) == 0)
+    HWND fg = capture ? GetForegroundWindow() : NULL;
+    if (now - last < 500 && hidden == fg)
         return;
     last = now;
 
-    if (capture) {
-        RECT r;
-        HWND fg = GetForegroundWindow();
-        if (fg && GetWindowRect(fg, &r))
-            ClipCursor(&r);
-        if (hidden < 5) { ShowCursor(FALSE); hidden++; }
-    } else {
-        if (hidden > 0) { ShowCursor(TRUE); hidden--; }
+    if (hidden && hidden != fg) {
+        if (IsWindow(hidden))
+            SetClassLongPtrA(hidden, GCLP_HCURSOR, (LONG_PTR)old);
+        hidden = NULL;
         ClipCursor(NULL);
+    }
+    if (fg) {
+        RECT r;
+        if (!hidden) {
+            old = (HCURSOR)GetClassLongPtrA(fg, GCLP_HCURSOR);
+            SetClassLongPtrA(fg, GCLP_HCURSOR, 0);
+            hidden = fg;
+            /* The class cursor shows at the next move; nudge it now. */
+            {
+                POINT pt;
+                if (GetCursorPos(&pt))
+                    SetCursorPos(pt.x, pt.y);
+            }
+        }
+        if (GetWindowRect(fg, &r))
+            ClipCursor(&r);
     }
 }
 
