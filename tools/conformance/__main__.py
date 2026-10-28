@@ -58,6 +58,22 @@ _COD_ENDP = re.compile(r"^(\S+)\s+ENDP\b")
 
 
 def _find_vcvars():
+    # vswhere names any installed Visual Studio with the C++ tools, whatever
+    # its version folder ("2022", "18", ...); the fixed paths below remain
+    # for machines without the installer.
+    vswhere = os.path.join(os.environ.get("ProgramFiles(x86)",
+                                          r"C:\Program Files (x86)"),
+                           "Microsoft Visual Studio", "Installer", "vswhere.exe")
+    if os.path.exists(vswhere):
+        r = subprocess.run([vswhere, "-latest", "-products", "*", "-requires",
+                            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                            "-property", "installationPath"],
+                           capture_output=True, text=True)
+        for line in r.stdout.splitlines():
+            p = os.path.join(line.strip(), "VC", "Auxiliary", "Build",
+                             "vcvars32.bat")
+            if line.strip() and os.path.exists(p):
+                return p
     for root in (os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
                  os.environ.get("ProgramFiles", r"C:\Program Files")):
         for ed in ("Community", "Professional", "Enterprise", "BuildTools"):
@@ -267,7 +283,7 @@ def main_with_args(argv, allow_container=True):
 
     if not backend:
         print("ERROR: no 32-bit x86 toolchain. Either a 32-bit MSVC "
-              "(vcvars32.bat under Visual Studio 2022), or Docker running so a "
+              "(vcvars32.bat from Visual Studio), or Docker running so a "
               "linux/386 container can supply the CPU.", file=sys.stderr)
         return 2
 
