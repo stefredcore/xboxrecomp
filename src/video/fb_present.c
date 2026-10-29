@@ -751,6 +751,22 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         wc.lpfnWndProc   = fb_wndproc;
         wc.hInstance     = GetModuleHandleA(NULL);
         wc.hCursor       = LoadCursorA(NULL, IDC_ARROW);
+        /* RECOMP_HIDE_CURSOR=1: no pointer over the window, for a title
+         * played with a pad only. A blank cursor, not NULL: a NULL class
+         * cursor leaves whatever pointer was last set. */
+        {
+            const char *e = getenv("RECOMP_HIDE_CURSOR");
+            if (e && *e && *e != '0') {
+                BYTE and_mask[32 * 32 / 8], xor_mask[32 * 32 / 8];
+                HCURSOR blank;
+                memset(and_mask, 0xFF, sizeof and_mask);   /* keep the screen */
+                memset(xor_mask, 0x00, sizeof xor_mask);   /* and draw nothing */
+                blank = CreateCursor(GetModuleHandleA(NULL), 0, 0, 32, 32,
+                                     and_mask, xor_mask);
+                if (blank)
+                    wc.hCursor = blank;
+            }
+        }
         wc.lpszClassName = "XboxRecompFramebuffer";
         RegisterClassA(&wc);
     }
