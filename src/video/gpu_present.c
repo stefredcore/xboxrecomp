@@ -104,12 +104,22 @@ int gpu_present_enabled(void)
     return on;
 }
 
-/* RECOMP_DISPLAY_ASPECT=<w>:<h> (16:9, say): the shape the frame is shown
- * at. A title drawing for a widescreen TV squeezes a 16:9 picture into its
- * 640x480, and the TV stretched it back out; unset, the frame's own shape. */
+/* The shape the frame is shown at: the frame's own, gpu_present_set_aspect's
+ * when it gave one, else RECOMP_DISPLAY_ASPECT=<w>:<h> (16:9, say) -- a
+ * title drawing for a widescreen TV squeezes a 16:9 picture into its
+ * 640x480, and the TV stretched it back out -- else the frame's own. */
+static float s_aspect_now;
+
+void gpu_present_set_aspect(float aspect)
+{
+    s_aspect_now = aspect;
+}
+
 float gpu_present_aspect(uint32_t w, uint32_t h)
 {
     static float a = -1.0f;
+    if (s_aspect_now > 0.0f)
+        return s_aspect_now;
     if (a < 0.0f) {
         const char *e = getenv("RECOMP_DISPLAY_ASPECT");
         float x = 0.0f, y = 0.0f;

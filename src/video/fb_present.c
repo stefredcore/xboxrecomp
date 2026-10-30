@@ -16,9 +16,10 @@
  *
  * The window opens at RECOMP_WINDOW_SCALE times the frame (default 2, made
  * smaller until it fits the desktop) and can be resized; the frame is
- * letterboxed to its 4:3 shape, or to RECOMP_DISPLAY_ASPECT's
- * (gpu_present_aspect) for a title drawing for a widescreen TV. F11 or Alt+Enter toggles borderless
- * fullscreen, RECOMP_FULLSCREEN=1 starts in it. Closing the window ends the
+ * letterboxed to its 4:3 shape, or to RECOMP_DISPLAY_ASPECT's for a title
+ * drawing for a widescreen TV, or to the shape a back end gives each frame
+ * (xbox_FramebufferWindowSetFrameAspect); a video frame keeps 4:3. F11 or
+ * Alt+Enter toggles borderless fullscreen, RECOMP_FULLSCREEN=1 starts in it. Closing the window ends the
  * process, as the SDL window does.
  *
  * A render back end that draws at a multiple of the title's resolution
@@ -80,6 +81,11 @@ static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
 typedef struct { XboxFramebufferGpuFrame f; uint32_t mode, aa_sy; } GpuFrame;
 static GpuFrame      s_present_gpu[2];
 static XboxFramebufferGpu s_gpu_frame;
+
+/* The shape each of the two is shown at (0: the default), as the back end
+ * gave it for the next frame. */
+static float         s_present_aspect[2];
+static volatile float s_frame_aspect;
 
 /* The last PVIDEO frame shown. A frame stays on screen until the next one or
  * STOP, but once its bank is consumed the title may reuse the memory, so the
@@ -233,6 +239,11 @@ void xbox_FramebufferWindowSetAAKernel(uint32_t kernel)
 void xbox_FramebufferWindowSetGpu(XboxFramebufferGpu fn)
 {
     s_gpu_frame = fn;
+}
+
+void xbox_FramebufferWindowSetFrameAspect(float aspect)
+{
+    s_frame_aspect = aspect;
 }
 
 /* One shown row of a 2x-wide anti-aliased 32-bit surface. The console's
@@ -468,6 +479,7 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
         }
     }
     present_dump(s_present[next], fb_va, pitch);
+    s_present_aspect[next] = s_frame_aspect;
     s_present_gpu[next].f.handle = NULL;
     if (s_gpu_frame) {
         GpuFrame g;
@@ -932,6 +944,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                        (size_t)s_fb_width * s_fb_height * 4);
             if (!fb_pinned)
                 video = fb_overlay();
+            gpu_present_set_aspect(video ? (float)s_fb_width / (float)s_fb_height
+                                         : s_present_aspect[idx]);
             if (!video && g.f.handle && gpu_present_active())
                 shown = gpu_present_shared(g.f.handle, s_fb_width * g.f.scale,
                                            s_fb_height * g.f.scale, g.mode, g.aa_sy);

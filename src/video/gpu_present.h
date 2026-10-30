@@ -19,8 +19,10 @@ int  gpu_present_frame(const uint32_t *pixels, uint32_t width, uint32_t height);
 int  gpu_present_shared(void *handle, uint32_t width, uint32_t height,
                         uint32_t mode, uint32_t aa_sy);
 int  gpu_present_active(void);
-/* Width / height the frame is shown at: RECOMP_DISPLAY_ASPECT, else w / h. */
+/* Width / height the frame is shown at: gpu_present_set_aspect's (> 0),
+ * else RECOMP_DISPLAY_ASPECT, else w / h. */
 float gpu_present_aspect(uint32_t w, uint32_t h);
+void  gpu_present_set_aspect(float aspect);
 void gpu_present_shutdown(void);
 #endif
 #endif

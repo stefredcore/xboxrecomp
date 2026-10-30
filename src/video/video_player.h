@@ -79,6 +79,12 @@ typedef struct {
 typedef int (*XboxFramebufferGpu)(uint32_t fb_va, uint32_t pitch,
                                   XboxFramebufferGpuFrame *out);
 void xbox_FramebufferWindowSetGpu(XboxFramebufferGpu fn);
+/* The shape (width / height) the frame about to be presented is shown at, for
+ * a back end that knows it frame by frame -- a title drawing its game for a
+ * widescreen TV and its menus for 4:3, say. Called on the thread that flips,
+ * before the frame is presented; 0 goes back to RECOMP_DISPLAY_ASPECT or the
+ * frame's own shape. A PVIDEO frame is always shown at the frame's shape. */
+void xbox_FramebufferWindowSetFrameAspect(float aspect);
 int  xbox_FramebufferDumpBmp(const char *path);
 /* Title bar: "<XBE title> | FPS: n | draws: n". The name is the certificate's
  * UTF-16 title (40 chars max); the stats come from each flip. */
