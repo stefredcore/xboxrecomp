@@ -99,7 +99,7 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 void xbox_FramebufferWindowSetAA(uint32_t sy) { (void)sy; }
 void xbox_FramebufferWindowSetAAKernel(uint32_t kernel) { (void)kernel; }
 /* ponytail: the SDL window shows guest memory only, at the title's size. */
-void xbox_FramebufferWindowSetHiRes(XboxFramebufferHiRes fn) { (void)fn; }
+void xbox_FramebufferWindowSetGpu(XboxFramebufferGpu fn) { (void)fn; }
 
 /* The window is opened by xbox_HostWindowMain, on the main thread. */
 void xbox_FramebufferWindowStart(void) {}

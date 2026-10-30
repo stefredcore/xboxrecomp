@@ -65,15 +65,20 @@ void xbox_FramebufferWindowSetAA(uint32_t sy);
 /* Convolution kernel the title resolves its 2x1 surface with: 0 none, 1 quincunx. */
 void xbox_FramebufferWindowSetAAKernel(uint32_t kernel);
 /* A render back end that draws at a multiple of the title's resolution
- * (guest memory still gets the title's size) hands the window its larger
- * copy of the frame: given the buffer flipped to, the function returns that
- * surface `scale` times as wide and as high, `hi_pitch` bytes per row, in the
- * guest's pixel format -- or NULL, and the window reads guest memory. Called
- * on the thread that flips, right after the back end's flip; the pixels are
- * copied before it returns. */
-typedef const void *(*XboxFramebufferHiRes)(uint32_t fb_va, uint32_t pitch,
-                                            uint32_t *scale, uint32_t *hi_pitch);
-void xbox_FramebufferWindowSetHiRes(XboxFramebufferHiRes fn);
+ * (guest memory still gets the title's size) hands the window the larger
+ * frame on the GPU: given the buffer flipped to, the function copies that
+ * surface into a D3D11 texture shared with the window -- a shared handle with
+ * a keyed mutex, both sides using key 0 -- and returns 1 with the handle and
+ * the factor; else 0, and the window shows guest memory. Called on the thread
+ * that flips, right after the back end's flip. Only one texture of the
+ * handles given out is written at a time, never the one given out last. */
+typedef struct {
+    void    *handle;            /* IDXGIResource::GetSharedHandle */
+    uint32_t scale;             /* the texture is the surface times this */
+} XboxFramebufferGpuFrame;
+typedef int (*XboxFramebufferGpu)(uint32_t fb_va, uint32_t pitch,
+                                  XboxFramebufferGpuFrame *out);
+void xbox_FramebufferWindowSetGpu(XboxFramebufferGpu fn);
 int  xbox_FramebufferDumpBmp(const char *path);
 /* Title bar: "<XBE title> | FPS: n | draws: n". The name is the certificate's
  * UTF-16 title (40 chars max); the stats come from each flip. */

@@ -13,8 +13,13 @@
  * Linear filtering, RECOMP_PRESENT_FILTER=point for sharp pixels;
  * RECOMP_PRESENT_VSYNC=0 presents without waiting for the display, as the
  * SDL window does. One frame is queued at most (RECOMP_PRESENT_LATENCY).
- * The frame texture follows the frame's size, which grows when a render back
- * end hands the window a larger frame than the title's.
+ * The frame texture follows the frame's size.
+ *
+ * A render back end drawing at a multiple of the title's resolution hands
+ * its frame over in a texture shared between the two devices
+ * (gpu_present_shared): resolved into the frame texture by a pass of its own
+ * -- the anti-aliasing filter fb_present.c applies on the CPU, done here --
+ * and shown from there the same way. Nothing goes through the CPU.
  */
 #if defined(_WIN32)
 #define COBJMACROS
@@ -34,6 +39,9 @@ static IDXGISwapChain           *s_chain;
 static ID3D11RenderTargetView   *s_rtv;
 static ID3D11Texture2D          *s_frame;      /* the guest frame, w x h */
 static ID3D11ShaderResourceView *s_srv;
+static ID3D11RenderTargetView   *s_frame_rtv;  /* ... drawn into by the resolve */
+static ID3D11PixelShader        *s_rps;        /* the resolve (gpu_present_shared) */
+static ID3D11Buffer             *s_rcb;
 static ID3D11SamplerState       *s_samp;
 static ID3D11VertexShader       *s_vs;
 static ID3D11PixelShader        *s_ps;
@@ -49,6 +57,42 @@ static const char s_hlsl[] =
     "V vs(uint i : SV_VertexID) { V o; float2 q = float2((i << 1) & 2, i & 2);\n"
     "  o.uv = q; o.p = float4(q * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
     "float4 ps(V i) : SV_Target { return float4(t.Sample(s, i.uv).rgb, 1); }\n";
+
+/* A shared frame into the frame texture, pixel for pixel, as aa_resolve_row
+ * (fb_present.c) filters a row: mode 0 copies, 1 averages the 2x1 samples
+ * behind a pixel, 2 the 2x2, 3 is quincunx (the pixel's sample at 1/2, the
+ * other column's samples in the rows above and below at 1/8 each), 4 takes
+ * every other sample. */
+static const char s_resolve_hlsl[] =
+    "Texture2D<float4> raw : register(t0);\n"
+    "cbuffer R : register(b0) { uint mode, aasy, rw, rh; };\n"
+    "struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };\n"
+    "float4 px(int x, int y) {\n"
+    "  return raw.Load(int3(clamp(x, 0, (int)rw - 1), clamp(y, 0, (int)rh - 1), 0));\n"
+    "}\n"
+    "float4 ps(V i) : SV_Target {\n"
+    "  int x = (int)i.p.x, y = (int)i.p.y; float4 c;\n"
+    "  if (mode == 0) c = px(x, y);\n"
+    "  else if (mode == 4) c = px(2 * x, y * (int)aasy);\n"
+    "  else if (mode == 2) c = (px(2 * x, 2 * y) + px(2 * x + 1, 2 * y)\n"
+    "                         + px(2 * x, 2 * y + 1) + px(2 * x + 1, 2 * y + 1)) * 0.25;\n"
+    "  else if (mode == 3) {\n"
+    "    int l = x ? 2 * x - 1 : 1, r = 2 * x + 1;\n"
+    "    c = (px(2 * x, y) * 4.0 + px(l, y - 1) + px(r, y - 1) + px(l, y + 1) + px(r, y + 1)) * 0.125;\n"
+    "  } else c = (px(2 * x, y) + px(2 * x + 1, y)) * 0.5;\n"
+    "  return float4(c.rgb, 1);\n"
+    "}\n";
+
+/* Textures opened from a back end's shared handles. */
+typedef struct {
+    void                     *handle;
+    ID3D11Texture2D          *tex;
+    ID3D11ShaderResourceView *srv;
+    IDXGIKeyedMutex          *km;
+    uint32_t                  w, h, last;
+} Shared;
+static Shared   s_shared[4];
+static uint32_t s_shared_use;
 
 int gpu_present_enabled(void)
 {
@@ -83,24 +127,28 @@ static int make_rtv(void)
 static int make_frame(uint32_t w, uint32_t h)
 {
     D3D11_TEXTURE2D_DESC td;
+    if (s_frame_rtv) { ID3D11RenderTargetView_Release(s_frame_rtv); s_frame_rtv = NULL; }
     if (s_srv)   { ID3D11ShaderResourceView_Release(s_srv); s_srv = NULL; }
     if (s_frame) { ID3D11Texture2D_Release(s_frame);        s_frame = NULL; }
     ZeroMemory(&td, sizeof td);
     td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
     td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_frame))
         || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_frame,
-                                                        NULL, &s_srv)))
+                                                        NULL, &s_srv))
+        || FAILED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)s_frame,
+                                                      NULL, &s_frame_rtv)))
         return 0;
     s_w = w; s_h = h;
     return 1;
 }
 
-static ID3DBlob *compile(const char *entry, const char *target)
+static ID3DBlob *compile_src(const char *src, const char *entry, const char *target)
 {
     ID3DBlob *code = NULL, *err = NULL;
-    HRESULT hr = D3DCompile(s_hlsl, sizeof s_hlsl - 1, "present", NULL, NULL, entry, target,
+    HRESULT hr = D3DCompile(src, strlen(src), "present", NULL, NULL, entry, target,
                             0, 0, &code, &err);
     if (FAILED(hr)) {
         fprintf(stderr, "  [D3D] present shader %s: %s\n", entry,
@@ -110,6 +158,11 @@ static ID3DBlob *compile(const char *entry, const char *target)
     }
     if (err) ID3D10Blob_Release(err);
     return code;
+}
+
+static ID3DBlob *compile(const char *entry, const char *target)
+{
+    return compile_src(s_hlsl, entry, target);
 }
 
 int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
@@ -199,15 +252,14 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
 /* Returns 0 when nothing was shown: the window is occluded or the display
  * is off, and Present does not wait for vsync then -- the caller must pace
  * itself instead of spinning. The pixels are read before this returns. */
-int gpu_present_frame(const uint32_t *pixels, uint32_t width, uint32_t height)
+/* The frame texture, letterboxed into the back buffer, and presented. */
+static int show_frame(void)
 {
     static const float black[4] = {0, 0, 0, 1};
     D3D11_VIEWPORT vp;
     uint32_t cw, ch;
     float sx, sy;
 
-    if (!s_rtv || !pixels)
-        return 0;
     client_size(&cw, &ch);
     if (cw != s_bw || ch != s_bh) {
         /* The window was resized (or went fullscreen): a back buffer its size. */
@@ -219,10 +271,6 @@ int gpu_present_frame(const uint32_t *pixels, uint32_t width, uint32_t height)
             return 0;
         s_bw = cw; s_bh = ch;
     }
-    if ((width != s_w || height != s_h) && !make_frame(width, height))
-        return 0;
-    ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_frame, 0, NULL,
-                                          pixels, s_w * 4, 0);
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_rtv, NULL);
     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_rtv, black);
     /* The largest rectangle of the frame's shape that fits, centred. */
@@ -246,8 +294,122 @@ int gpu_present_frame(const uint32_t *pixels, uint32_t width, uint32_t height)
     return IDXGISwapChain_Present(s_chain, (UINT)s_vsync, 0) == S_OK && s_vsync;
 }
 
+/* Returns 0 when nothing was shown: the window is occluded or the display
+ * is off, and Present does not wait for vsync then -- the caller must pace
+ * itself instead of spinning. The pixels are read before this returns. */
+int gpu_present_frame(const uint32_t *pixels, uint32_t width, uint32_t height)
+{
+    if (!s_rtv || !pixels)
+        return 0;
+    if ((width != s_w || height != s_h) && !make_frame(width, height))
+        return 0;
+    ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_frame, 0, NULL,
+                                          pixels, s_w * 4, 0);
+    return show_frame();
+}
+
+static void shared_free(Shared *e)
+{
+    if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
+    if (e->km)  IDXGIKeyedMutex_Release(e->km);
+    if (e->tex) ID3D11Texture2D_Release(e->tex);
+    memset(e, 0, sizeof *e);
+}
+
+/* The texture behind a shared handle, opened once; the least recently used
+ * of four makes room. */
+static Shared *shared_get(void *handle)
+{
+    Shared *e, *victim = &s_shared[0];
+    D3D11_TEXTURE2D_DESC td;
+    int i;
+
+    for (i = 0; i < 4; i++) {
+        e = &s_shared[i];
+        if (e->tex && e->handle == handle) {
+            e->last = ++s_shared_use;
+            return e;
+        }
+        if (!e->tex || e->last < victim->last)
+            victim = e;
+    }
+    e = victim;
+    shared_free(e);
+    if (FAILED(ID3D11Device_OpenSharedResource(s_dev, (HANDLE)handle, &IID_ID3D11Texture2D,
+                                               (void **)&e->tex))
+        || FAILED(ID3D11Texture2D_QueryInterface(e->tex, &IID_IDXGIKeyedMutex, (void **)&e->km))
+        || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)e->tex,
+                                                        NULL, &e->srv))) {
+        shared_free(e);
+        return NULL;
+    }
+    ID3D11Texture2D_GetDesc(e->tex, &td);
+    e->handle = handle;
+    e->w = td.Width;
+    e->h = td.Height;
+    e->last = ++s_shared_use;
+    return e;
+}
+
+int gpu_present_shared(void *handle, uint32_t width, uint32_t height,
+                       uint32_t mode, uint32_t aa_sy)
+{
+    ID3D11ShaderResourceView *none = NULL;
+    D3D11_VIEWPORT vp;
+    uint32_t cb[4];
+    Shared *e;
+
+    if (!s_rtv)
+        return -1;
+    if (!s_rps) {
+        D3D11_BUFFER_DESC bd;
+        ID3DBlob *b = compile_src(s_resolve_hlsl, "ps", "ps_4_0");
+        ZeroMemory(&bd, sizeof bd);
+        bd.ByteWidth = sizeof cb;
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        if (!b || FAILED(ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b),
+                                                        ID3D10Blob_GetBufferSize(b), NULL, &s_rps))
+               || FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_rcb))) {
+            if (b) ID3D10Blob_Release(b);
+            return -1;
+        }
+        ID3D10Blob_Release(b);
+    }
+    if (!(e = shared_get(handle)))
+        return -1;
+    if ((width != s_w || height != s_h) && !make_frame(width, height))
+        return -1;
+    /* The back end holds the key while it copies the next frame in. */
+    if (IDXGIKeyedMutex_AcquireSync(e->km, 0, 100) != S_OK)
+        return -1;
+    cb[0] = mode; cb[1] = aa_sy ? aa_sy : 1; cb[2] = e->w; cb[3] = e->h;
+    ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_rcb, 0, NULL, cb, 0, 0);
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_frame_rtv, NULL);
+    vp.TopLeftX = 0; vp.TopLeftY = 0;
+    vp.Width = (float)s_w; vp.Height = (float)s_h;
+    vp.MinDepth = 0; vp.MaxDepth = 1;
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_rps, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_rcb);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &e->srv);
+    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
+    IDXGIKeyedMutex_ReleaseSync(e->km, 0);
+    return show_frame();
+}
+
 void gpu_present_shutdown(void)
 {
+    int i;
+    for (i = 0; i < 4; i++)
+        shared_free(&s_shared[i]);
+    if (s_rcb)   { ID3D11Buffer_Release(s_rcb);               s_rcb = NULL; }
+    if (s_rps)   { ID3D11PixelShader_Release(s_rps);          s_rps = NULL; }
+    if (s_frame_rtv) { ID3D11RenderTargetView_Release(s_frame_rtv); s_frame_rtv = NULL; }
     if (s_ps)    { ID3D11PixelShader_Release(s_ps);           s_ps = NULL; }
     if (s_vs)    { ID3D11VertexShader_Release(s_vs);          s_vs = NULL; }
     if (s_samp)  { ID3D11SamplerState_Release(s_samp);        s_samp = NULL; }
