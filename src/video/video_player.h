@@ -64,6 +64,16 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 void xbox_FramebufferWindowSetAA(uint32_t sy);
 /* Convolution kernel the title resolves its 2x1 surface with: 0 none, 1 quincunx. */
 void xbox_FramebufferWindowSetAAKernel(uint32_t kernel);
+/* A render back end that draws at a multiple of the title's resolution
+ * (guest memory still gets the title's size) hands the window its larger
+ * copy of the frame: given the buffer flipped to, the function returns that
+ * surface `scale` times as wide and as high, `hi_pitch` bytes per row, in the
+ * guest's pixel format -- or NULL, and the window reads guest memory. Called
+ * on the thread that flips, right after the back end's flip; the pixels are
+ * copied before it returns. */
+typedef const void *(*XboxFramebufferHiRes)(uint32_t fb_va, uint32_t pitch,
+                                            uint32_t *scale, uint32_t *hi_pitch);
+void xbox_FramebufferWindowSetHiRes(XboxFramebufferHiRes fn);
 int  xbox_FramebufferDumpBmp(const char *path);
 /* Title bar: "<XBE title> | FPS: n | draws: n". The name is the certificate's
  * UTF-16 title (40 chars max); the stats come from each flip. */

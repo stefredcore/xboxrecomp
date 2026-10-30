@@ -13,6 +13,8 @@
  * Linear filtering, RECOMP_PRESENT_FILTER=point for sharp pixels;
  * RECOMP_PRESENT_VSYNC=0 presents without waiting for the display, as the
  * SDL window does. One frame is queued at most (RECOMP_PRESENT_LATENCY).
+ * The frame texture follows the frame's size, which grows when a render back
+ * end hands the window a larger frame than the title's.
  */
 #if defined(_WIN32)
 #define COBJMACROS
@@ -77,6 +79,24 @@ static int make_rtv(void)
     return SUCCEEDED(hr);
 }
 
+/* The frame texture and its view at w x h, replacing any other size. */
+static int make_frame(uint32_t w, uint32_t h)
+{
+    D3D11_TEXTURE2D_DESC td;
+    if (s_srv)   { ID3D11ShaderResourceView_Release(s_srv); s_srv = NULL; }
+    if (s_frame) { ID3D11Texture2D_Release(s_frame);        s_frame = NULL; }
+    ZeroMemory(&td, sizeof td);
+    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_frame))
+        || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_frame,
+                                                        NULL, &s_srv)))
+        return 0;
+    s_w = w; s_h = h;
+    return 1;
+}
+
 static ID3DBlob *compile(const char *entry, const char *target)
 {
     ID3DBlob *code = NULL, *err = NULL;
@@ -95,7 +115,6 @@ static ID3DBlob *compile(const char *entry, const char *target)
 int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
 {
     DXGI_SWAP_CHAIN_DESC sd;
-    D3D11_TEXTURE2D_DESC td;
     D3D11_SAMPLER_DESC smp;
     ID3DBlob *vsb, *psb;
     HRESULT hr;
@@ -149,10 +168,6 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
             IDXGIDevice1_Release(d1);
         }
     }
-    ZeroMemory(&td, sizeof td);
-    td.Width = width; td.Height = height; td.MipLevels = 1; td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     ZeroMemory(&smp, sizeof smp);
     smp.Filter = (f && (f[0] == 'p' || f[0] == 'P')) ? D3D11_FILTER_MIN_MAG_MIP_POINT
                                                      : D3D11_FILTER_MIN_MAG_MIP_LINEAR;
@@ -161,8 +176,7 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
     vsb = compile("vs", "vs_4_0");
     psb = compile("ps", "ps_4_0");
     if (!vsb || !psb || !make_rtv()
-        || FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_frame))
-        || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_frame, NULL, &s_srv))
+        || !make_frame(width, height)
         || FAILED(ID3D11Device_CreateSamplerState(s_dev, &smp, &s_samp))
         || FAILED(ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(vsb),
                                                   ID3D10Blob_GetBufferSize(vsb), NULL, &s_vs))
@@ -185,7 +199,7 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
 /* Returns 0 when nothing was shown: the window is occluded or the display
  * is off, and Present does not wait for vsync then -- the caller must pace
  * itself instead of spinning. The pixels are read before this returns. */
-int gpu_present_frame(const uint32_t *pixels)
+int gpu_present_frame(const uint32_t *pixels, uint32_t width, uint32_t height)
 {
     static const float black[4] = {0, 0, 0, 1};
     D3D11_VIEWPORT vp;
@@ -205,6 +219,8 @@ int gpu_present_frame(const uint32_t *pixels)
             return 0;
         s_bw = cw; s_bh = ch;
     }
+    if ((width != s_w || height != s_h) && !make_frame(width, height))
+        return 0;
     ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_frame, 0, NULL,
                                           pixels, s_w * 4, 0);
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_rtv, NULL);
