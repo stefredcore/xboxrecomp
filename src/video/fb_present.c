@@ -75,6 +75,7 @@ static int           s_auto_enter_ms = -1;
  * thread is never reading the one being filled. */
 static uint32_t     *s_present[2];
 static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
+static HANDLE s_flip_event;                /* RECOMP_PRESENT_VSYNC=0: a new frame */
 
 /* The same frame at a back end's larger size, on the GPU, for each of the
  * two (handle NULL: none), and how to resolve it (aa_mode). */
@@ -433,6 +434,8 @@ void xbox_FramebufferWindowPublish(void)
     LONG idx = InterlockedExchange(&s_pending_idx, -1);
     if (idx >= 0)
         InterlockedExchange(&s_present_idx, idx);
+    if (s_flip_event)
+        SetEvent(s_flip_event);
 }
 
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
@@ -506,6 +509,8 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
         InterlockedExchange(&s_pending_idx, next);
     else
         InterlockedExchange(&s_present_idx, next);
+    if (s_flip_event)
+        SetEvent(s_flip_event);
 }
 
 /* Title bar, the way ps3recomp's window shows it. Written by the flip,
@@ -926,9 +931,19 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         }
     }
 
+    {
+        /* Without vsync nothing paces the loop. Each frame is shown as soon
+         * as it is published, rather than at the next 16 ms sleep; the
+         * timeout keeps messages and a PVIDEO frame going without flips. */
+        const char *vs = getenv("RECOMP_PRESENT_VSYNC");
+        if (vs && vs[0] == '0')
+            s_flip_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+    }
     while (InterlockedCompareExchange(&s_fb_running, 1, 1)) {
         MSG msg;
         int paced = 0;
+        if (s_flip_event)
+            WaitForSingleObject(s_flip_event, 16);
         fb_handoff_shown(hwnd, 0);
         while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
@@ -1046,7 +1061,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                 fflush(stderr);
             }
         }
-        if (!paced)
+        if (!paced && !s_flip_event)
             Sleep(16);                  /* D3D11's Present waited for vsync */
     }
 
