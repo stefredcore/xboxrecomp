@@ -121,7 +121,7 @@ NTSTATUS __stdcall xbox_XeUnloadSection(PXBE_SECTION_HEADER Section)
  * settings. On real hardware these are stored in the 256-byte EEPROM on the
  * SMBus. For recompilation, we return sensible defaults:
  *   - Region: North America
- *   - Video: NTSC, widescreen+HDTV enabled
+ *   - Video: no widescreen or HDTV mode a title reads (RECOMP_VIDEO_FLAGS)
  *   - Language: English
  *   - Audio: Stereo, Dolby Digital
  *   - DVD Region: Region 1 (North America)
@@ -216,6 +216,19 @@ static int console_is_pal(void)
     return v;
 }
 
+/* The dashboard's video settings (XC_VIDEO). XGetVideoFlags hands a title
+ * bits 16 and up: 0x10000 widescreen, 0x20000 720p, 0x40000 1080i, 0x80000
+ * 480p, 0x100000 letterbox, 0x400000 PAL 60 Hz. A title that supports 16:9
+ * draws for a widescreen TV when the first is set. RECOMP_VIDEO_FLAGS=<n>
+ * (hex with 0x) answers that; unset, the value this file always gave, which
+ * reads as none of them. */
+static ULONG video_flags(void)
+{
+    const char *e = getenv("RECOMP_VIDEO_FLAGS");
+    return e && *e ? (ULONG)strtoul(e, NULL, 0)
+                   : XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV;
+}
+
 #define XC_FACTORY_AV_REGION    0x103
 #define XC_FACTORY_GAME_REGION  0x104
 #define XC_AV_REGION_PAL_I      0x00800300u  /* PAL, 50 Hz */
@@ -253,9 +266,9 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         break;
 
     case XC_VIDEO:
-        /* NTSC with widescreen and HDTV support enabled */
+        /* video_flags: by default none a title reads */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV;
+            *(PULONG)Value = video_flags();
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }
@@ -346,7 +359,7 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         memcpy(blk + 0x28, &s_tz.std_bias, 4);
         memcpy(blk + 0x2C, &s_tz.dlt_bias, 4);
         { ULONG v = 1; memcpy(blk + 0x30, &v, 4); }                       /* English */
-        { ULONG v = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV; memcpy(blk + 0x34, &v, 4); }
+        { ULONG v = video_flags(); memcpy(blk + 0x34, &v, 4); }
         /* 0x58 is MiscFlags (0); DvdRegion is the last field, at 0x5C. */
         { ULONG v = console_is_pal() ? 2 : 1; memcpy(blk + 0x5C, &v, 4); } /* DVD region */
         if (Type) *Type = 3;

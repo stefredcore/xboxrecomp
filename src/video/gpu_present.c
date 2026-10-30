@@ -104,6 +104,22 @@ int gpu_present_enabled(void)
     return on;
 }
 
+/* RECOMP_DISPLAY_ASPECT=<w>:<h> (16:9, say): the shape the frame is shown
+ * at. A title drawing for a widescreen TV squeezes a 16:9 picture into its
+ * 640x480, and the TV stretched it back out; unset, the frame's own shape. */
+float gpu_present_aspect(uint32_t w, uint32_t h)
+{
+    static float a = -1.0f;
+    if (a < 0.0f) {
+        const char *e = getenv("RECOMP_DISPLAY_ASPECT");
+        float x = 0.0f, y = 0.0f;
+        a = 0.0f;
+        if (e && sscanf(e, "%f:%f", &x, &y) == 2 && x > 0.0f && y > 0.0f)
+            a = x / y;
+    }
+    return a > 0.0f ? a : (float)w / (float)h;
+}
+
 static void client_size(uint32_t *w, uint32_t *h)
 {
     RECT r;
@@ -258,7 +274,7 @@ static int show_frame(void)
     static const float black[4] = {0, 0, 0, 1};
     D3D11_VIEWPORT vp;
     uint32_t cw, ch;
-    float sx, sy;
+    float a;
 
     client_size(&cw, &ch);
     if (cw != s_bw || ch != s_bh) {
@@ -273,11 +289,15 @@ static int show_frame(void)
     }
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_rtv, NULL);
     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_rtv, black);
-    /* The largest rectangle of the frame's shape that fits, centred. */
-    sx = (float)s_bw / (float)s_w;
-    sy = (float)s_bh / (float)s_h;
-    vp.Width = (float)s_w * (sx < sy ? sx : sy);
-    vp.Height = (float)s_h * (sx < sy ? sx : sy);
+    /* The largest rectangle of the shown shape that fits, centred. */
+    a = gpu_present_aspect(s_w, s_h);
+    if ((float)s_bw > (float)s_bh * a) {
+        vp.Height = (float)s_bh;
+        vp.Width = (float)s_bh * a;
+    } else {
+        vp.Width = (float)s_bw;
+        vp.Height = (float)s_bw / a;
+    }
     vp.TopLeftX = ((float)s_bw - vp.Width) * 0.5f;
     vp.TopLeftY = ((float)s_bh - vp.Height) * 0.5f;
     vp.MinDepth = 0; vp.MaxDepth = 1;

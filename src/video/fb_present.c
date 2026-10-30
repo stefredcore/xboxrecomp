@@ -16,7 +16,8 @@
  *
  * The window opens at RECOMP_WINDOW_SCALE times the frame (default 2, made
  * smaller until it fits the desktop) and can be resized; the frame is
- * letterboxed to its 4:3 shape. F11 or Alt+Enter toggles borderless
+ * letterboxed to its 4:3 shape, or to RECOMP_DISPLAY_ASPECT's
+ * (gpu_present_aspect) for a title drawing for a widescreen TV. F11 or Alt+Enter toggles borderless
  * fullscreen, RECOMP_FULLSCREEN=1 starts in it. Closing the window ends the
  * process, as the SDL window does.
  *
@@ -732,10 +733,13 @@ static void gdi_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
         FillRect(hdc, &c, (HBRUSH)GetStockObject(BLACK_BRUSH));
         lw = cw; lh = ch;
     }
-    if ((long long)cw * s_fb_height <= (long long)ch * s_fb_width) {
-        w = cw; h = (LONG)((long long)cw * s_fb_height / s_fb_width);
-    } else {
-        h = ch; w = (LONG)((long long)ch * s_fb_width / s_fb_height);
+    {
+        float a = gpu_present_aspect(s_fb_width, s_fb_height);
+        if ((float)cw <= (float)ch * a) {
+            w = cw; h = (LONG)((float)cw / a + 0.5f);
+        } else {
+            h = ch; w = (LONG)((float)ch * a + 0.5f);
+        }
     }
     SetStretchBltMode(hdc, HALFTONE);
     SetBrushOrgEx(hdc, 0, 0, NULL);     /* HALFTONE wants it after the mode */
@@ -834,7 +838,9 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         }
         for (;; scale--) {
             r.left = 0; r.top = 0;
-            r.right = (LONG)s_fb_width * scale; r.bottom = (LONG)s_fb_height * scale;
+            r.right = (LONG)((float)s_fb_height * scale
+                             * gpu_present_aspect(s_fb_width, s_fb_height) + 0.5f);
+            r.bottom = (LONG)s_fb_height * scale;
             AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
             if (scale <= 1 || (r.right - r.left <= work.right - work.left
                                && r.bottom - r.top <= work.bottom - work.top))
