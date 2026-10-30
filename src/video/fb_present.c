@@ -214,6 +214,18 @@ void xbox_FramebufferWindowSetAAKernel(uint32_t kernel)
     s_fb_aa_kernel = kernel;
 }
 
+/* The console's TV encoder mixes each line with its neighbours, by the level
+ * D3D's SetFlickerFilter sends through AvSendTVEncoderOption (Nightfire: 5).
+ * Its factors are not known; each neighbour weighs level / 20, so 5 is the
+ * usual 1-2-1. RECOMP_FLICKER_FILTER=0 turns it off. */
+void xbox_FramebufferWindowSetFlicker(uint32_t level)
+{
+    const char *e = getenv("RECOMP_FLICKER_FILTER");
+    if (level > 5)
+        level = 5;
+    gpu_present_set_flicker(e && e[0] == '0' ? 0.0f : (float)level / 20.0f);
+}
+
 /* One shown row of a 2x-wide anti-aliased 32-bit surface. The console's
  * scan-out filters the 2x1 (or 2x2, s_fb_aa_sy 2) samples behind each pixel
  * into one; taking every other sample instead showed the aliasing the title

@@ -35,6 +35,9 @@ static ID3D11ShaderResourceView *s_srv;
 static ID3D11SamplerState       *s_samp;
 static ID3D11VertexShader       *s_vs;
 static ID3D11PixelShader        *s_ps;
+static ID3D11PixelShader        *s_fps;        /* s_ps with the flicker filter */
+static ID3D11Buffer             *s_fcb;
+static float                     s_flicker;    /* weight of each neighbour line */
 static HWND                      s_hwnd;
 static uint32_t                  s_w, s_h;      /* frame size */
 static uint32_t                  s_bw, s_bh;    /* back buffer (client) size */
@@ -46,7 +49,13 @@ static const char s_hlsl[] =
     "struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };\n"
     "V vs(uint i : SV_VertexID) { V o; float2 q = float2((i << 1) & 2, i & 2);\n"
     "  o.uv = q; o.p = float4(q * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
-    "float4 ps(V i) : SV_Target { return float4(t.Sample(s, i.uv).rgb, 1); }\n";
+    "float4 ps(V i) : SV_Target { return float4(t.Sample(s, i.uv).rgb, 1); }\n"
+    "cbuffer F : register(b0) { float fw, fdy, f0, f1; };\n"
+    "float4 pf(V i) : SV_Target {\n"
+    "  float3 c = t.Sample(s, i.uv).rgb * (1 - 2 * fw)\n"
+    "           + (t.Sample(s, i.uv - float2(0, fdy)).rgb\n"
+    "              + t.Sample(s, i.uv + float2(0, fdy)).rgb) * fw;\n"
+    "  return float4(c, 1); }\n";
 
 int gpu_present_enabled(void)
 {
@@ -185,6 +194,34 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
 /* Returns 0 when nothing was shown: the window is occluded or the display
  * is off, and Present does not wait for vsync then -- the caller must pace
  * itself instead of spinning. The pixels are read before this returns. */
+void gpu_present_set_flicker(float weight)
+{
+    s_flicker = weight;
+}
+
+static int flicker_ready(void)
+{
+    if (!s_fps) {
+        ID3DBlob *b = compile("pf", "ps_4_0");
+        D3D11_BUFFER_DESC bd;
+        HRESULT hr;
+        if (!b)
+            return 0;
+        hr = ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b),
+                                            ID3D10Blob_GetBufferSize(b), NULL, &s_fps);
+        ID3D10Blob_Release(b);
+        if (FAILED(hr))
+            return 0;
+        ZeroMemory(&bd, sizeof bd);
+        bd.ByteWidth = 16;
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_fcb)))
+            return 0;
+    }
+    return s_fcb != NULL;
+}
+
 int gpu_present_frame(const uint32_t *pixels)
 {
     static const float black[4] = {0, 0, 0, 1};
@@ -221,7 +258,14 @@ int gpu_present_frame(const uint32_t *pixels)
     ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
     ID3D11DeviceContext_VSSetShader(s_ctx, s_vs, NULL, 0);
-    ID3D11DeviceContext_PSSetShader(s_ctx, s_ps, NULL, 0);
+    if (s_flicker > 0.0f && flicker_ready()) {
+        float cb[4] = { s_flicker, 1.0f / (float)s_h, 0.0f, 0.0f };
+        ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_fcb, 0, NULL, cb, 0, 0);
+        ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_fcb);
+        ID3D11DeviceContext_PSSetShader(s_ctx, s_fps, NULL, 0);
+    } else {
+        ID3D11DeviceContext_PSSetShader(s_ctx, s_ps, NULL, 0);
+    }
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &s_srv);
     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_samp);
     ID3D11DeviceContext_Draw(s_ctx, 3, 0);
@@ -232,6 +276,8 @@ int gpu_present_frame(const uint32_t *pixels)
 
 void gpu_present_shutdown(void)
 {
+    if (s_fcb)   { ID3D11Buffer_Release(s_fcb);               s_fcb = NULL; }
+    if (s_fps)   { ID3D11PixelShader_Release(s_fps);          s_fps = NULL; }
     if (s_ps)    { ID3D11PixelShader_Release(s_ps);           s_ps = NULL; }
     if (s_vs)    { ID3D11VertexShader_Release(s_vs);          s_vs = NULL; }
     if (s_samp)  { ID3D11SamplerState_Release(s_samp);        s_samp = NULL; }

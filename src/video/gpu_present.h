@@ -11,6 +11,9 @@ int  gpu_present_init(HWND hwnd, uint32_t width, uint32_t height);
  * (so the caller need not sleep), 0 when unpaced or nothing was shown. */
 int  gpu_present_frame(const uint32_t *pixels);
 int  gpu_present_active(void);
+/* Weight of each neighbouring line in what is shown, as the TV encoder's
+ * flicker filter; 0 is off. */
+void gpu_present_set_flicker(float weight);
 void gpu_present_shutdown(void);
 #endif
 #endif

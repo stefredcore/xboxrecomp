@@ -64,6 +64,8 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 void xbox_FramebufferWindowSetAA(uint32_t sy);
 /* Convolution kernel the title resolves its 2x1 surface with: 0 none, 1 quincunx. */
 void xbox_FramebufferWindowSetAAKernel(uint32_t kernel);
+/* The TV encoder's flicker filter, 0 (off) to 5, as the title set it. */
+void xbox_FramebufferWindowSetFlicker(uint32_t level);
 int  xbox_FramebufferDumpBmp(const char *path);
 /* Title bar: "<XBE title> | FPS: n | draws: n". The name is the certificate's
  * UTF-16 title (40 chars max); the stats come from each flip. */
