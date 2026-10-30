@@ -129,6 +129,23 @@ static int mcpx_apu_center_both(void)
     return on;
 }
 
+/* A stereo downmix of DirectSound's bin layout, in place of the GP and EP
+ * programs that do this on the console: front and the crosstalk pair that
+ * carries 3D voices at full level, centre and both rear pairs at -3 dB. LFE
+ * and the effect sends (bin 10 up) are not speakers: without the GP their
+ * effect does not exist, and added dry they doubled voices already heard on
+ * the front bins (Nightfire's bin 11 on the right speaker alone).
+ * RECOMP_APU_DOWNMIX=0 goes back to the sum of every bin. */
+static int mcpx_apu_stereo_downmix(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_DOWNMIX");
+        on = (e && *e) ? (atoi(e) != 0) : 1;
+    }
+    return on;
+}
+
 /* GPRST (GP region + 0xFFFC): the GP runs only with both reset bits set, as
  * in xemu's gp_write. Nothing else models the GP, so this is kept for the
  * =auto ack alone. Before the first write the GP counts as running: a title
@@ -293,7 +310,13 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
              * counts. This is not what a real EP does; it is the cheapest
              * mixdown that stops discarding audio. */
             float left, right;
-            if (mcpx_apu_mixdown_all()) {
+            if (mcpx_apu_stereo_downmix()) {
+                const float m3 = 0.70710678f;
+                left = mixbins[0][i] + mixbins[6][i]
+                     + m3 * (mixbins[2][i] + mixbins[4][i] + mixbins[8][i]);
+                right = mixbins[1][i] + mixbins[7][i]
+                      + m3 * (mixbins[2][i] + mixbins[5][i] + mixbins[9][i]);
+            } else if (mcpx_apu_mixdown_all()) {
                 int both = mcpx_apu_center_both();
                 left = 0.0f;
                 right = 0.0f;
