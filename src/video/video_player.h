@@ -85,6 +85,8 @@ void xbox_FramebufferWindowSetGpu(XboxFramebufferGpu fn);
  * before the frame is presented; 0 goes back to RECOMP_DISPLAY_ASPECT or the
  * frame's own shape. A PVIDEO frame is always shown at the frame's shape. */
 void xbox_FramebufferWindowSetFrameAspect(float aspect);
+/* The TV encoder's flicker filter, 0 (off) to 5, as the title set it. */
+void xbox_FramebufferWindowSetFlicker(uint32_t level);
 int  xbox_FramebufferDumpBmp(const char *path);
 /* Title bar: "<XBE title> | FPS: n | draws: n". The name is the certificate's
  * UTF-16 title (40 chars max); the stats come from each flip. */

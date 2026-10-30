@@ -1492,6 +1492,11 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
     (void)RegisterBase;
     (void)Param;
 
+    /* D3D's SetFlickerFilter passes no Result, so before the check for one. */
+    if (Option == AV_OPTION_FLICKER_FILTER) {
+        extern void xbox_FramebufferWindowSetFlicker(uint32_t level);
+        xbox_FramebufferWindowSetFlicker((uint32_t)Param);
+    }
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL,
         "AvSendTVEncoderOption: option=0x%02X param=0x%X", Option, Param);
 
