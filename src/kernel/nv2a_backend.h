@@ -152,7 +152,11 @@ typedef struct {
     uint32_t       clip_near_z;
     uint32_t       fog_enable, fog_mode;
     float          fog_param[2];
+    /* What oFog holds before the program writes it (nv2a_vsh_carry_fog):
+     * a program that never writes it gets the fog the last one left. */
+    float          carry_fog[4];
 } Nv2aProgramBatch;
+#define NV2A_BACKEND_HAS_CARRY_FOG 1   /* Nv2aProgramBatch.carry_fog */
 
 typedef struct {
     const Nv2aVertex  *vertices;    /* triangle list: count is a multiple of 3 */

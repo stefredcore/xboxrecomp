@@ -561,7 +561,9 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 
     out[0] = out[1] = out[2] = 0.0f;
     out[3] = 1.0f;
-    if (!a->size || !a->stride)
+    /* A stride of 0 is one value for every vertex: the first element (xemu
+     * does the same); it read as 0,0,0,1 here. */
+    if (!a->size)
         return 0;
     if (s_gpu.inline_active) {
         /* The batch arrived as INLINE_ARRAY, so `offset` is a byte offset into
@@ -3654,6 +3656,10 @@ static int draw_program_batch(void)
     float fc[4];
     int st;
 
+    /* Points become squares on the CPU path (raster_points), which needs
+     * each vertex's position and size first. */
+    if (s_gpu.prim == NV_PRIM_POINTS)
+        return 0;
     if (!(len = nv2a_vsh_program(&words)))
         return 0;
     if (near_z < 0) {
@@ -3737,6 +3743,7 @@ static int draw_program_batch(void)
     pb.fog_mode = s_gpu.fog_mode;
     pb.fog_param[0] = s_gpu.fog_param[0];
     pb.fog_param[1] = s_gpu.fog_param[1];
+    memcpy(pb.carry_fog, nv2a_vsh_carry_fog(), sizeof pb.carry_fog);
 
     /* The rest as backend_flush hands over a combiner batch. */
     current_surface(&surf);
@@ -3769,6 +3776,58 @@ static int draw_program_batch(void)
         note_texture_use();
     note_drawn();
     return 1;
+}
+
+/* Points, as a square of two triangles each. Nightfire's snow in The
+ * Exchange is a batch of 4096 point sprites a frame, and dropped -- points
+ * were not drawn at all -- the night stayed clear. The size is the
+ * program's oPts with point parameters on (SET_POINT_PARAMS_ENABLE), else
+ * SET_POINT_SIZE in eighths of a pixel. With SET_POINT_SMOOTH_ENABLE, a
+ * point sprite, every texture stage gets coordinates running 0..1 across
+ * the square (the texel size for a linear texture), as a shader gets
+ * gl_PointCoord; without, every corner keeps the vertex's own. The snow's
+ * combiner reads stage 3 too (a 32x32 mask), and its program writes no oT3. */
+static void raster_points(uint32_t n)
+{
+    int sprite = (s_reg[0x31C / 4] & 1) != 0;
+    int params = (s_reg[0x318 / 4] & 1) != 0 && batch_uses_program();
+    float fixed = (float)(s_reg[0x43C / 4] & 0x1FF) / 8.0f;
+    uint32_t i;
+
+    for (i = 0; i < n; i++) {
+        const Nv2aVshOutput *p = &s_xf[i];
+        Nv2aVshOutput q[4];
+        float size = params ? p->psize : fixed, hx, hy;
+        int k, st;
+
+        if (!(size > 0.0f))
+            continue;                   /* also NaN */
+        if (size > 512.0f)
+            size = 512.0f;
+        hx = size * 0.5f * s_gpu.aa_sx;
+        hy = size * 0.5f * s_gpu.aa_sy;
+        for (k = 0; k < 4; k++) {       /* top-left, top-right, bottom-right, bottom-left */
+            float u = (k == 1 || k == 2) ? 1.0f : 0.0f, v = k >= 2 ? 1.0f : 0.0f;
+            q[k] = *p;
+            q[k].pos[0] = p->pos[0] + (u * 2.0f - 1.0f) * hx;
+            q[k].pos[1] = p->pos[1] + (v * 2.0f - 1.0f) * hy;
+            if (sprite)
+                for (st = 0; st < 4; st++) {
+                    const Texture *t = &s_gpu.texs[st];
+                    float su = 1.0f, sv = 1.0f;
+                    if (!tex_size_from_format(t->color)) {
+                        su = (float)t->width;
+                        sv = (float)t->height;
+                    }
+                    q[k].tex[st][0] = u * su;
+                    q[k].tex[st][1] = v * sv;
+                    q[k].tex[st][2] = 0.0f;
+                    q[k].tex[st][3] = 1.0f;
+                }
+        }
+        raster_xf_clipped(&q[0], &q[1], &q[2]);
+        raster_xf_clipped(&q[0], &q[2], &q[3]);
+    }
 }
 
 static void raster_batch_program(void)
@@ -3905,8 +3964,11 @@ static void raster_batch_program(void)
             raster_xf_clipped(&s_xf[i], &s_xf[i+3], &s_xf[i+2]);
         }
         break;
-    default:
+    case NV_PRIM_POINTS:
+        raster_points(n);
         break;
+    default:
+        break;                          /* lines: not yet */
     }
     /* The batch's triangles, all at once (see xf_queue_push). */
     xf_queue_flush();
@@ -3921,7 +3983,7 @@ static void raster_batch(void)
     uint32_t before = s_gpu.tris_drawn;
     int textured = 0;
 
-    if (s_gpu.idx_count < 3)
+    if (s_gpu.idx_count < (s_gpu.prim == NV_PRIM_POINTS ? 1u : 3u))
         return;
     if (batch_uses_program() || batch_is_ffp()) {
         raster_batch_program();
@@ -4056,6 +4118,41 @@ static int pb_verbose(void)
     if (on < 0)
         on = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
     return on;
+}
+
+/* What a draw leaves behind on the hardware (xemu's flush_draw and
+ * carryover): every attribute read from an array keeps the provoking -- last
+ * -- vertex's value as its current one, which a later batch without that
+ * array reads in its place; and in vertex-program mode the program runs once
+ * more on those values, the fog it writes becoming what oFog starts from in
+ * the next program. Nightfire's snow reads its fog from attribute 3, which it
+ * has no array for: it gets the colour of the last thing drawn, not the white
+ * D3D set at start-up, and stayed in thick fog where the console has none. */
+static void carry_after_draw(void)
+{
+    uint32_t a, last;
+    float v[4];
+
+    if (!s_gpu.idx_count)
+        return;
+    last = s_gpu.idx[s_gpu.idx_count - 1];
+    for (a = 0; a < NV_VERTEX_ATTRS; a++)
+        if (s_gpu.attr[a].size && fetch_attr(&s_gpu.attr[a], last, v))
+            memcpy(s_gpu.imm_attr[a], v, sizeof v);
+    if (batch_uses_program() && !nv2a_vsh_writes_constants()) {
+        float in[NV2A_VSH_INPUTS][4];
+        Nv2aVshOutput out;
+        for (a = 0; a < NV2A_VSH_INPUTS; a++) {
+            if (a < NV_VERTEX_ATTRS)
+                memcpy(in[a], s_gpu.imm_attr[a], sizeof in[a]);
+            else {
+                in[a][0] = in[a][1] = in[a][2] = 0.0f;
+                in[a][3] = 1.0f;
+            }
+        }
+        if (nv2a_vsh_run((const float (*)[4])in, &out))
+            nv2a_vsh_set_carry_fog(out.fog);
+    }
 }
 
 static void draw_primitive(void)
@@ -4268,6 +4365,7 @@ static void draw_primitive(void)
             }
         }
     }
+    carry_after_draw();
 }
 
 /* Draw the vertices the title wrote straight into the pushbuffer.
