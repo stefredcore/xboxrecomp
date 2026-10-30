@@ -35,6 +35,7 @@ typedef struct {
     float d0[4], d1[4];
     float fog[4];
     float tex[4][4];
+    float psize;                /* oPts.x (o6): a point's size in pixels */
 } Nv2aVshOutput;
 
 void nv2a_vsh_set_load_slot(uint32_t slot);           /* _PROGRAM_LOAD      */
@@ -49,6 +50,10 @@ void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
  * FINAL flag within program memory), which the caller treats as "cannot
  * transform this batch" rather than drawing garbage. */
 int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
+/* The value oFog starts from in every run (the hardware's fog carry-over:
+ * what the program wrote there for the last draw's carried attributes). */
+void nv2a_vsh_set_carry_fog(const float fog[4]);
+const float *nv2a_vsh_carry_fog(void);
 /* Decode the loaded program for nv2a_vsh_run, if it changed. Call it on the
  * thread that loads programs before running vertices on several threads. */
 void nv2a_vsh_prepare(void);

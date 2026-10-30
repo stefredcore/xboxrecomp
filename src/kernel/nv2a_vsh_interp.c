@@ -29,6 +29,21 @@
  */
 #include "nv2a_vsh_interp.h"
 
+/* What oFog holds before the program writes it: on the hardware, what the
+ * program left there for the vertex run after the last draw (the executor's
+ * carry_after_draw, as xemu's carryover). (0,0,0,1) at reset. */
+static float s_carry_fog[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+
+void nv2a_vsh_set_carry_fog(const float fog[4])
+{
+    memcpy(s_carry_fog, fog, sizeof s_carry_fog);
+}
+
+const float *nv2a_vsh_carry_fog(void)
+{
+    return s_carry_fog;
+}
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -431,6 +446,7 @@ static int vsh_run_ref(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
     memset(temp, 0, sizeof temp);
     memset(&opos, 0, sizeof opos);
     memset(outregs, 0, sizeof outregs);
+    memcpy(outregs[5], s_carry_fog, sizeof outregs[5]);    /* nv2a_vsh_set_carry_fog */
     outregs[3][3] = outregs[4][3] = 1.0f;      /* colours default opaque */
     /* Unwritten texture coordinates are (0,0,0,1), as xemu initialises them:
      * a projective stage divides by q, and q = 0 would put every texel of an
@@ -494,6 +510,7 @@ static int vsh_run_ref(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
             memcpy(out->tex[1], outregs[10], sizeof out->tex[1]);
             memcpy(out->tex[2], outregs[11], sizeof out->tex[2]);
             memcpy(out->tex[3], outregs[12], sizeof out->tex[3]);
+            out->psize = outregs[6][0];
             return 1;
         }
     }
@@ -629,6 +646,7 @@ static int vsh_run_dec(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
     memset(temp, 0, sizeof temp);
     memset(&opos, 0, sizeof opos);
     memset(outregs, 0, sizeof outregs);
+    memcpy(outregs[5], s_carry_fog, sizeof outregs[5]);    /* nv2a_vsh_set_carry_fog */
     outregs[3][3] = outregs[4][3] = 1.0f;      /* as vsh_run_ref */
     outregs[9][3] = outregs[10][3] = outregs[11][3] = outregs[12][3] = 1.0f;
 
@@ -677,6 +695,7 @@ static int vsh_run_dec(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
     memcpy(out->tex[1], outregs[10], sizeof out->tex[1]);
     memcpy(out->tex[2], outregs[11], sizeof out->tex[2]);
     memcpy(out->tex[3], outregs[12], sizeof out->tex[3]);
+    out->psize = outregs[6][0];
     return 1;
 }
 
