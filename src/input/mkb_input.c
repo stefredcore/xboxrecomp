@@ -675,6 +675,19 @@ static int pointer_wanted(void)
     return t && (LONG)(GetTickCount() - (DWORD)t) < 250;
 }
 
+static volatile LONG s_aiming_tick;
+
+void mkb_title_aiming(void)
+{
+    InterlockedExchange(&s_aiming_tick, (LONG)(GetTickCount() | 1));
+}
+
+static int title_aiming(void)
+{
+    LONG t = InterlockedCompareExchange(&s_aiming_tick, 0, 0);
+    return t && (LONG)(GetTickCount() - (DWORD)t) < 250;
+}
+
 /* Radial deadzone compensation: an input radius in [0..1] comes out as
  * [dz..1], so the smallest mouse correction still clears the title's
  * own deadzone, and the response stays linear above it. */
@@ -899,6 +912,7 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
         const MkbAction *a = action_find(s_cfg.aim_action);
         aiming = a && action_held(a);
     }
+    aiming |= title_aiming();
     wheel = wheel_pulse(aiming);
     for (i = 0; i < INPUT_CONTROL_COUNT; i++)
         if ((wheel >> i) & 1)

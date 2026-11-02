@@ -112,6 +112,14 @@ int mkb_action(const char *name);
 void mkb_pointer_show(void);
 int mkb_pointer_click(void);
 
+/*
+ * Aiming as the title sees it: while a title hook calls mkb_title_aiming()
+ * every frame, the wheel takes its "aim+" bindings as if aim_control were
+ * held -- a zoom on the wheel alone while the title's own aim is on, however
+ * it was switched on. A quarter second without a call ends it.
+ */
+void mkb_title_aiming(void);
+
 #ifdef __cplusplus
 }
 #endif
