@@ -105,6 +105,7 @@ int mkb_action(const char *name);
  * every frame, the window's own cursor shows over the game, still confined
  * to it, and the title reads where it is with xbox_FramebufferWindowPointer
  * (video_player.h). A quarter second without a call hides it again.
+ * RECOMP_MKB_CURSOR names a .cur file to show instead of the window's own.
  * mkb_pointer_click() is the left button, held, under the same conditions
  * as mkb_action.
  */

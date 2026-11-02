@@ -594,6 +594,8 @@ static void mkb_manage_cursor(int capture)
 {
     static HWND hidden;          /* window whose class cursor we blanked */
     static HCURSOR old, blank;
+    static HCURSOR menu;         /* RECOMP_MKB_CURSOR, a .cur for the menus' pointer */
+    static int menu_tried;
     static int shown;            /* the old cursor back while captured (2) */
     static unsigned long last;
 
@@ -628,8 +630,22 @@ static void mkb_manage_cursor(int capture)
             shown = 0;
             changed = 1;
         }
+        if (!menu_tried) {
+            /* At RECOMP_MKB_CURSOR_SIZE pixels (default 40, a little over
+             * the system's 32) times the screen's scale: LoadCursorFromFile
+             * would bring it to the system size. */
+            const char *e = getenv("RECOMP_MKB_CURSOR"), *z = getenv("RECOMP_MKB_CURSOR_SIZE");
+            HDC dc = GetDC(NULL);
+            int dpi = dc ? GetDeviceCaps(dc, LOGPIXELSY) : 96, px = z && atoi(z) > 0 ? atoi(z) : 40;
+            if (dc)
+                ReleaseDC(NULL, dc);
+            px = MulDiv(px, dpi, 96);
+            menu_tried = 1;
+            if (e && *e)
+                menu = (HCURSOR)LoadImageA(NULL, e, IMAGE_CURSOR, px, px, LR_LOADFROMFILE);
+        }
         if (hidden && shown != want) {
-            SetClassLongPtrA(hidden, GCLP_HCURSOR, (LONG_PTR)(want ? old : blank));
+            SetClassLongPtrA(hidden, GCLP_HCURSOR, (LONG_PTR)(want ? (menu ? menu : old) : blank));
             shown = want;
             changed = 1;
         }
