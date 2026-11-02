@@ -205,7 +205,8 @@ static void tz_init(void)
  * it) -- Nightfire's driving image looks for pal\eng\*.mad and the European
  * menu text, and on an NTSC answer it asks for NTSC\eng movies and the
  * North-American text table, neither of which the European disc carries.
- * Unset: the answers this file always gave. */
+ * RECOMP_CONSOLE_REGION=ntsc (console_is_ntsc) answers as a North-American
+ * console. Unset: the answers this file always gave. */
 static int console_is_pal(void)
 {
     static int v = -1;
@@ -232,7 +233,21 @@ static ULONG video_flags(void)
 #define XC_FACTORY_AV_REGION    0x103
 #define XC_FACTORY_GAME_REGION  0x104
 #define XC_AV_REGION_PAL_I      0x00800300u  /* PAL, 50 Hz */
+#define XC_AV_REGION_NTSC_M     0x00400100u  /* NTSC-M, 60 Hz */
+#define XC_GAME_REGION_NA       0x00000001u
 #define XC_GAME_REGION_RESTOFWORLD 0x00000004u
+
+/* RECOMP_CONSOLE_REGION=ntsc: answer as a North-American console, for an
+ * NTSC disc. Unset, both factory settings read as zero, as they always did. */
+static int console_is_ntsc(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("RECOMP_CONSOLE_REGION");
+        v = e && (e[0] == 'n' || e[0] == 'N');
+    }
+    return v;
+}
 
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength)
@@ -241,11 +256,15 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         return STATUS_INVALID_PARAMETER;
     tz_init();
 
-    if (console_is_pal() && (ValueIndex == XC_FACTORY_AV_REGION
-                             || ValueIndex == XC_FACTORY_GAME_REGION)) {
+    if ((console_is_pal() || console_is_ntsc())
+            && (ValueIndex == XC_FACTORY_AV_REGION || ValueIndex == XC_FACTORY_GAME_REGION)) {
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = ValueIndex == XC_FACTORY_AV_REGION
-                           ? XC_AV_REGION_PAL_I : XC_GAME_REGION_RESTOFWORLD;
+            if (console_is_pal())
+                *(PULONG)Value = ValueIndex == XC_FACTORY_AV_REGION
+                               ? XC_AV_REGION_PAL_I : XC_GAME_REGION_RESTOFWORLD;
+            else
+                *(PULONG)Value = ValueIndex == XC_FACTORY_AV_REGION
+                               ? XC_AV_REGION_NTSC_M : XC_GAME_REGION_NA;
             if (Type) *Type = 4;
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }
