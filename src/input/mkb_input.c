@@ -593,12 +593,14 @@ static int game_is_foreground(void)
 static void mkb_manage_cursor(int capture)
 {
     static HWND hidden;          /* window whose class cursor we blanked */
-    static HCURSOR old;
+    static HCURSOR old, blank;
+    static int shown;            /* the old cursor back while captured (2) */
     static unsigned long last;
 
     unsigned long now = GetTickCount();
     HWND fg = capture ? GetForegroundWindow() : NULL;
-    if (now - last < 500 && hidden == fg)
+    int want = capture == 2;
+    if (now - last < 500 && hidden == fg && shown == want)
         return;
     last = now;
 
@@ -606,11 +608,12 @@ static void mkb_manage_cursor(int capture)
         if (IsWindow(hidden))
             SetClassLongPtrA(hidden, GCLP_HCURSOR, (LONG_PTR)old);
         hidden = NULL;
+        shown = 0;
         ClipCursor(NULL);
     }
     if (fg) {
-        static HCURSOR blank;
         RECT r;
+        int changed = 0;
         if (!blank) {
             BYTE and_mask[32 * 32 / 8], xor_mask[32 * 32 / 8];
             memset(and_mask, 0xFF, sizeof and_mask);   /* keep the screen */
@@ -622,16 +625,38 @@ static void mkb_manage_cursor(int capture)
             old = (HCURSOR)GetClassLongPtrA(fg, GCLP_HCURSOR);
             SetClassLongPtrA(fg, GCLP_HCURSOR, (LONG_PTR)blank);
             hidden = fg;
-            /* The class cursor shows at the next move; nudge it now. */
-            {
-                POINT pt;
-                if (GetCursorPos(&pt))
-                    SetCursorPos(pt.x, pt.y);
-            }
+            shown = 0;
+            changed = 1;
+        }
+        if (hidden && shown != want) {
+            SetClassLongPtrA(hidden, GCLP_HCURSOR, (LONG_PTR)(want ? old : blank));
+            shown = want;
+            changed = 1;
+        }
+        /* The class cursor shows at the next move; nudge it now. */
+        if (changed) {
+            POINT pt;
+            if (GetCursorPos(&pt))
+                SetCursorPos(pt.x, pt.y);
         }
         if (GetWindowRect(fg, &r))
             ClipCursor(&r);
     }
+}
+
+/* mkb_pointer_show(): the time of the last call, 0 never. */
+static volatile LONG s_pointer_tick;
+
+void mkb_pointer_show(void)
+{
+    InterlockedExchange(&s_pointer_tick, (LONG)(GetTickCount() | 1));
+}
+
+static int pointer_wanted(void)
+{
+    LONG t = InterlockedCompareExchange(&s_pointer_tick, 0, 0);
+    /* Signed: the |1 can put the mark a millisecond ahead of now. */
+    return t && (LONG)(GetTickCount() - (DWORD)t) < 250;
 }
 
 /* Radial deadzone compensation: an input radius in [0..1] comes out as
@@ -788,6 +813,13 @@ int mkb_mouse_look(double *yaw_deg, double *pitch_deg)
     return 1;
 }
 
+int mkb_pointer_click(void)
+{
+    if (!mkb_enabled() || !InterlockedCompareExchange(&s_active, 0, 0))
+        return 0;
+    return s_vk_down[VK_LBUTTON] && game_is_foreground();
+}
+
 int mkb_action(const char *name)
 {
     const MkbAction *a;
@@ -832,7 +864,7 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
         InterlockedExchange(&s_wheel, 0);
         return 0;
     }
-    mkb_manage_cursor(1);
+    mkb_manage_cursor(pointer_wanted() ? 2 : 1);
 
     /* Held keys, and keys that went down and up since the last poll (a
      * click shorter than a poll still counts once). */

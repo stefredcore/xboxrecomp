@@ -35,6 +35,7 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -87,6 +88,7 @@ static XboxFramebufferGpu s_gpu_frame;
  * gave it for the next frame. */
 static float         s_present_aspect[2];
 static volatile float s_frame_aspect;
+static HWND volatile s_fb_hwnd;     /* the window, for xbox_FramebufferWindowPointer */
 
 /* The last PVIDEO frame shown. A frame stays on screen until the next one or
  * STOP, but once its bank is consumed the title may reuse the memory, so the
@@ -245,6 +247,31 @@ void xbox_FramebufferWindowSetGpu(XboxFramebufferGpu fn)
 void xbox_FramebufferWindowSetFrameAspect(float aspect)
 {
     s_frame_aspect = aspect;
+}
+
+int xbox_FramebufferWindowPointer(int *x, int *y)
+{
+    HWND h = s_fb_hwnd;
+    POINT p;
+    RECT c;
+    double a, w, hh;
+
+    if (!h || !GetCursorPos(&p) || !ScreenToClient(h, &p) || !GetClientRect(h, &c)
+            || c.right <= 0 || c.bottom <= 0)
+        return 0;
+    /* Placed as gdi_blit and the D3D11 present place it: centred, at the
+     * shape the frame was last shown at. */
+    a = gpu_present_aspect(s_fb_width, s_fb_height);
+    if (c.right <= c.bottom * a) {
+        w = c.right;
+        hh = c.right / a;
+    } else {
+        hh = c.bottom;
+        w = c.bottom * a;
+    }
+    *x = (int)floor((p.x - (c.right - w) / 2) * s_fb_width / w);
+    *y = (int)floor((p.y - (c.bottom - hh) / 2) * s_fb_height / hh);
+    return *x >= 0 && *y >= 0 && *x < (int)s_fb_width && *y < (int)s_fb_height;
 }
 
 /* The console's TV encoder mixes each line with its neighbours, by the level
@@ -896,6 +923,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         InterlockedExchange(&s_fb_running, 0);
         return 0;
     }
+    s_fb_hwnd = hwnd;
     hdc = GetDC(hwnd);
     {
         const char *fs = getenv("RECOMP_FULLSCREEN");

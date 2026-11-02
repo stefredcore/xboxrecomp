@@ -100,6 +100,17 @@ int mkb_mouse_look(double *yaw_deg, double *pitch_deg);
  */
 int mkb_action(const char *name);
 
+/*
+ * A pointer for a title's menus: while a title hook calls mkb_pointer_show()
+ * every frame, the window's own cursor shows over the game, still confined
+ * to it, and the title reads where it is with xbox_FramebufferWindowPointer
+ * (video_player.h). A quarter second without a call hides it again.
+ * mkb_pointer_click() is the left button, held, under the same conditions
+ * as mkb_action.
+ */
+void mkb_pointer_show(void);
+int mkb_pointer_click(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -85,6 +85,10 @@ void xbox_FramebufferWindowSetGpu(XboxFramebufferGpu fn);
  * before the frame is presented; 0 goes back to RECOMP_DISPLAY_ASPECT or the
  * frame's own shape. A PVIDEO frame is always shown at the frame's shape. */
 void xbox_FramebufferWindowSetFrameAspect(float aspect);
+/* The pointer over the window, in the frame's pixels (640 x 480 for a
+ * 640 x 480 frame) as the frame is shown, borders left out. Returns 1 while
+ * it is over the picture. */
+int  xbox_FramebufferWindowPointer(int *x, int *y);
 /* The TV encoder's flicker filter, 0 (off) to 5, as the title set it. */
 void xbox_FramebufferWindowSetFlicker(uint32_t level);
 int  xbox_FramebufferDumpBmp(const char *path);
