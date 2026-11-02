@@ -23,7 +23,8 @@
  * mkb.ini: "setting = value" lines, '#' or ';' comments. The settings above
  * by their short names (sens, full_cps, dz, acc, invert_y), plus
  * window_ms, wheel_ms, mouse_stick (right, left, none), aim_control (a
- * control name), diagonal (round, full), and one line per pad control
+ * control name, or an action as "+aim"), diagonal (round, full), and one
+ * line per pad control
  * listing up to four keys:
  *
  *   right_trigger = mouse1
@@ -90,10 +91,12 @@ int mkb_mouse_look(double *yaw_deg, double *pitch_deg);
  * gives a key list a title hook asks about by name, for input the title
  * takes past its pad and control scheme -- moving with WASD whichever
  * stick the player's scheme gives that job. Keys bound to an action are
- * usually left off the pad controls.
+ * usually left off the pad controls. The wheel names bind here as well, a
+ * step reading as held for wheel_ms, the aim+ ones while aim_control is.
  *
- * Returns 1 while one of the action's keys is held, the layer captured
- * and the game in the foreground; 0 otherwise, and for an unknown name.
+ * Returns 1 while one of the action's keys is held or its wheel step
+ * plays, the layer captured and the game in the foreground; 0 otherwise,
+ * and for an unknown name.
  */
 int mkb_action(const char *name);
 

@@ -57,12 +57,14 @@ static const char *const k_wheel_names[WHEEL_KINDS] = {
 };
 
 /* A title action ("+forward = w, up"): keys a title hook asks about by
- * name with mkb_action(), past the pad and its control scheme. */
-#define MKB_ACTIONS 32
+ * name with mkb_action(), past the pad and its control scheme. The wheel
+ * names work here too, as a pulse like a pad control's. */
+#define MKB_ACTIONS 40
 typedef struct {
     char    name[24];   /* without the '+' */
     uint8_t key[INPUT_BINDINGS_PER_CONTROL];
     uint8_t count;
+    uint8_t wheel;      /* bit per wheel kind */
 } MkbAction;
 
 typedef struct {
@@ -75,6 +77,7 @@ typedef struct {
     int    invert_y;    /* invert the vertical aim axis              */
     int    mouse_stick; /* 0 right, 1 left, 2 none                   */
     int    aim_control; /* InputControl that switches the wheel, -1 none */
+    char   aim_action[24]; /* or the action that does ("+aim"), "" none */
     double look_sens;   /* direct look: "sensitivity" as on the PC   */
     double m_yaw, m_pitch; /* degrees per count at sensitivity 1     */
     InputBindings keys;
@@ -171,6 +174,7 @@ static int bind_action(const char *name, const char *text)
         strcpy(a->name, name);
     }
     a->count = 0;
+    a->wheel = 0;
     while (*p) {
         const char *e = strchr(p, ',');
         size_t n = e ? (size_t)(e - p) : strlen(p);
@@ -178,11 +182,16 @@ static int bind_action(const char *name, const char *text)
         while (b0 < b1 && (p[b0] == ' ' || p[b0] == '\t')) b0++;
         while (b1 > b0 && (p[b1 - 1] == ' ' || p[b1 - 1] == '\t')) b1--;
         if (b1 > b0 && b1 - b0 < sizeof tok) {
-            int vk;
+            int vk, w, wheel = -1;
             memcpy(tok, p + b0, b1 - b0);
             tok[b1 - b0] = 0;
-            vk = xbox_InputMap_KeyFromName(tok);
-            if (vk > 0 && vk < 256 && a->count < INPUT_BINDINGS_PER_CONTROL)
+            for (w = 0; w < WHEEL_KINDS; w++)
+                if (!_stricmp(tok, k_wheel_names[w]))
+                    wheel = w;
+            vk = wheel < 0 ? xbox_InputMap_KeyFromName(tok) : 0;
+            if (wheel >= 0)
+                a->wheel |= (uint8_t)(1u << wheel);
+            else if (vk > 0 && vk < 256 && a->count < INPUT_BINDINGS_PER_CONTROL)
                 a->key[a->count++] = (uint8_t)vk;
             else if (_stricmp(tok, "none"))
                 bad++;
@@ -224,7 +233,12 @@ static int mkb_apply_kv(const char *key, const char *val)
     } else if (!_stricmp(key, "mouse_stick")) {
         s_cfg.mouse_stick = !_stricmp(val, "left") ? 1 : !_stricmp(val, "none") ? 2 : 0;
     } else if (!_stricmp(key, "aim_control")) {
-        s_cfg.aim_control = xbox_InputMap_ControlFromName(val);
+        s_cfg.aim_action[0] = 0;
+        s_cfg.aim_control = -1;
+        if (val[0] == '+' && strlen(val + 1) < sizeof s_cfg.aim_action)
+            strcpy(s_cfg.aim_action, val + 1);
+        else
+            s_cfg.aim_control = xbox_InputMap_ControlFromName(val);
     } else if (!_stricmp(key, "diagonal")) {
         s_cfg.keys.diagonal = !_stricmp(val, "full") ? INPUT_DIAGONAL_FULL
                                                      : INPUT_DIAGONAL_ROUND;
@@ -376,6 +390,7 @@ static volatile LONG s_motion_head;           /* samples written */
 static CRITICAL_SECTION s_motion_lock;
 
 static volatile LONG s_wheel;                 /* steps since last poll, + up */
+static volatile LONG s_wheel_kind = -1;       /* the kind pulsing now, -1 none */
 static volatile LONG s_look_dx, s_look_dy;    /* counts since last mkb_mouse_look */
 static volatile unsigned char s_vk_down[256]; /* held keys and mouse buttons */
 static volatile unsigned char s_vk_hit[256];  /* went down since last poll   */
@@ -670,13 +685,36 @@ static void mouse_speed(double *vx, double *vy)
     *vy = sy * 1000.0 / s_cfg.window_ms;
 }
 
+/* An action's keys, held now. */
+static int action_held(const MkbAction *a)
+{
+    int k;
+
+    for (k = 0; k < a->count; k++)
+        if (s_vk_down[a->key[k]])
+            return 1;
+    return 0;
+}
+
+static const MkbAction *action_find(const char *name)
+{
+    int i;
+
+    for (i = 0; i < s_cfg.actions; i++)
+        if (!_stricmp(s_cfg.action[i].name, name))
+            return &s_cfg.action[i];
+    return NULL;
+}
+
 /* The wheel's pulses: each step holds its controls for wheel_ms, then
- * releases them as long. Returns the mask of controls pressed now. */
+ * releases them as long. Returns the mask of controls pressed now; the
+ * actions read the kind in s_wheel_kind. */
 static uint32_t wheel_pulse(int aiming)
 {
     static LONG pending;             /* steps not yet played, + up */
     static int phase;                /* 0 idle, 1 pressed, 2 released */
     static uint32_t mask;
+    static int kind;
     static DWORD since;
     DWORD now = GetTickCount();
 
@@ -688,13 +726,19 @@ static uint32_t wheel_pulse(int aiming)
     if (phase == 2 && now - since >= (DWORD)s_cfg.wheel_ms)
         phase = 0;
     if (phase == 0 && pending) {
-        int up = pending > 0;
-        uint32_t aimed = s_cfg.wheel[up ? AIM_WHEEL_UP : AIM_WHEEL_DOWN];
+        int up = pending > 0, aim_kind = up ? AIM_WHEEL_UP : AIM_WHEEL_DOWN, i;
+        uint32_t aimed = s_cfg.wheel[aim_kind];
+        int aimed_action = 0;
+        for (i = 0; i < s_cfg.actions; i++)
+            if (s_cfg.action[i].wheel & (1u << aim_kind))
+                aimed_action = 1;
         pending += up ? -1 : 1;
-        mask = aiming && aimed ? aimed : s_cfg.wheel[up ? WHEEL_UP : WHEEL_DOWN];
+        kind = aiming && (aimed || aimed_action) ? aim_kind : up ? WHEEL_UP : WHEEL_DOWN;
+        mask = s_cfg.wheel[kind];
         phase = 1;
         since = now;
     }
+    InterlockedExchange(&s_wheel_kind, phase == 1 ? kind : -1);
     return phase == 1 ? mask : 0;
 }
 
@@ -746,21 +790,18 @@ int mkb_mouse_look(double *yaw_deg, double *pitch_deg)
 
 int mkb_action(const char *name)
 {
-    int i, k;
+    const MkbAction *a;
+    LONG kind;
 
     if (!name || !mkb_enabled() || !InterlockedCompareExchange(&s_active, 0, 0))
         return 0;
     if (*name == '+')
         name++;
-    for (i = 0; i < s_cfg.actions; i++) {
-        const MkbAction *a = &s_cfg.action[i];
-        if (_stricmp(a->name, name))
-            continue;
-        for (k = 0; k < a->count; k++)
-            if (s_vk_down[a->key[k]])
-                return game_is_foreground();
+    if ((a = action_find(name)) == NULL)
         return 0;
-    }
+    kind = InterlockedCompareExchange(&s_wheel_kind, 0, 0);
+    if (action_held(a) || (kind >= 0 && (a->wheel >> kind) & 1))
+        return game_is_foreground();
     return 0;
 }
 
@@ -806,6 +847,10 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
           && (s_cfg.aim_control < 8
                   ? (mk.wButtons >> s_cfg.aim_control) & 1
                   : mk.bAnalogButtons[s_cfg.aim_control - 8] != 0);
+    if (s_cfg.aim_action[0]) {
+        const MkbAction *a = action_find(s_cfg.aim_action);
+        aiming = a && action_held(a);
+    }
     wheel = wheel_pulse(aiming);
     for (i = 0; i < INPUT_CONTROL_COUNT; i++)
         if ((wheel >> i) & 1)
