@@ -249,6 +249,40 @@ class Disassembler:
 
         return [decoded[a] for a in sorted(decoded)]
 
+    # Capstone's disasm() decodes the whole buffer it is given, with details,
+    # before it yields the first instruction. The CFG walk below stops at the
+    # next jump, a few instructions in, so handing it everything up to end_va
+    # decoded the rest of the range once per entry: quadratic, and 785 of the
+    # 855 seconds of a cold disassembly of Nightfire's default.xbe, where
+    # FunctionDetector probes whole gaps this way. _stream reads a window at a
+    # time instead.
+    _WINDOW = 512
+    _MAX_INSN = 15          # longest x86 instruction
+
+    def _stream(self, raw_bytes, start_va, offset, size):
+        """The instructions of raw_bytes[offset:size] (raw_bytes[0] at
+        start_va), exactly as one disasm() over the whole range yields them,
+        ending at the first undecodable byte. Only an instruction starting at
+        least _MAX_INSN bytes before a window's end is passed on, so each was
+        decoded with all its bytes present; the next window starts at the
+        first one that was not."""
+        while offset < size:
+            end = min(size, offset + self._WINDOW)
+            sure = size if end == size else end - self._MAX_INSN
+            pos = offset
+            for cs_insn in self._cs.disasm(raw_bytes[offset:end], start_va + offset):
+                at = cs_insn.address - start_va
+                if at >= sure:
+                    break
+                yield cs_insn
+                pos = at + cs_insn.size
+            else:
+                if pos < sure:      # an undecodable byte, or the end
+                    return
+            if pos == offset:
+                return
+            offset = pos
+
     def disassemble_cfg(self, raw_bytes, start_va, end_va, entry_points,
                         stop_addresses=None, stop_mnemonics=()):
         """Decode reachable instruction streams from an explicit worklist."""
@@ -264,7 +298,7 @@ class Disassembler:
             if not (start_va <= entry < end_va) or entry in decoded:
                 continue
             offset = entry - start_va
-            for cs_insn in self._cs.disasm(raw_bytes[offset:size], entry):
+            for cs_insn in self._stream(raw_bytes, start_va, offset, size):
                 if cs_insn.address != entry and cs_insn.address in stop_addresses:
                     break
                 if cs_insn.address >= end_va or cs_insn.address in decoded:
