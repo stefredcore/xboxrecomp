@@ -218,6 +218,9 @@ def main():
     parser.add_argument("--gen-dir",
                         help="Output dir for split generated files "
                              "(default: src/game/recomp/gen)")
+    parser.add_argument("--no-global-opt", metavar="FILE",
+                        help="JSON list of {\"start\": \"0x...\"} functions "
+                             "to compile without MSVC's global optimisations")
     parser.add_argument("--disasm-dir",
                         help="Directory holding tools.disasm output "
                              "(default: tools/disasm/output)")
@@ -513,12 +516,18 @@ def main():
                   + (f"; {len(wrap & known)} wrapped as sub_X_gen" if wrap else ""),
                   file=sys.stderr)
 
+        no_global_opt = set()
+        if args.no_global_opt:
+            with open(args.no_global_opt) as f:
+                no_global_opt = {int(e["start"], 16) for e in json.load(f)}
+
         stats = translator.translate_batch_split(
             funcs,
             output_dir=gen_dir,
             chunk_size=args.split,
             verbose=args.verbose,
             manual=manual,
+            no_global_opt=no_global_opt,
         )
 
         t_translate = time.time() - t0

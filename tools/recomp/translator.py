@@ -3488,7 +3488,8 @@ class BatchTranslator:
 
     def translate_batch_split(self, func_list, output_dir, chunk_size=1000,
                               header_name="recomp_funcs.h",
-                              prefix="recomp", verbose=False, manual=None):
+                              prefix="recomp", verbose=False, manual=None,
+                              max_chunk_bytes=1_500_000, no_global_opt=()):
         """
         Translate functions into multiple .c files + a shared header.
 
@@ -3679,8 +3680,21 @@ class BatchTranslator:
 
         # Split translations into chunks and write .c files
         generated_files = [header_path]
-        chunks = [translations[i:i+chunk_size]
-                  for i in range(0, len(translations), chunk_size)]
+        # A chunk also ends at max_chunk_bytes of code. Counting functions
+        # alone put dozens of 19,000-line alias entries of one Nightfire
+        # function into a single 16 MB file, and the build then waited minutes
+        # on that one compiler process while the other cores sat idle.
+        chunks = []
+        chunk, chunk_bytes = [], 0
+        for item in translations:
+            if chunk and (len(chunk) >= chunk_size
+                          or chunk_bytes + len(item[2]) > max_chunk_bytes):
+                chunks.append(chunk)
+                chunk, chunk_bytes = [], 0
+            chunk.append(item)
+            chunk_bytes += len(item[2])
+        if chunk:
+            chunks.append(chunk)
 
         # Remove chunk files a previous, larger run left behind. Projects glob
         # gen/*.c into their build, so a stale chunk keeps compiling: it still
@@ -3713,6 +3727,15 @@ class BatchTranslator:
                 "",
             ]
             for addr, name, code in chunk:
+                # A few functions keep MSVC's global optimiser busy for
+                # minutes (Nightfire's sub_00080590: 236 s at /O2, 0.3 s
+                # without it) and hold the whole build up. The project names
+                # them; local optimisation still applies.
+                if addr in no_global_opt:
+                    code = ('#ifdef _MSC_VER\n#pragma optimize("g", off)\n'
+                            '#endif\n' + code +
+                            '\n#ifdef _MSC_VER\n#pragma optimize("", on)\n'
+                            '#endif')
                 c_lines.append(code)
 
             write_if_changed(c_path, "\n".join(c_lines))

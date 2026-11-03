@@ -19,6 +19,7 @@ from capstone.x86_const import (
 from capstone import x86_const
 
 from . import config
+from ..lazy_cs import LazyCs
 from .loader import BinaryImage, SectionInfo
 
 
@@ -112,7 +113,7 @@ class DisasmEngine:
 
     def __init__(self, image: BinaryImage):
         self.image = image
-        self._cs = Cs(CS_ARCH_X86, CS_MODE_32)
+        self._cs = LazyCs(CS_ARCH_X86, CS_MODE_32)
         self._cs.detail = True
 
         # Instruction cache: address -> Instruction

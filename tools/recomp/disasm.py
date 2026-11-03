@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32, CS_OP_IMM, CS_OP_MEM
 
+from ..lazy_cs import LazyCs
+
 
 # LOOP family: ECX is the counter, not a flag. They branch, so they end a
 # block like any other conditional jump, but they need their own lifting.
@@ -150,10 +152,37 @@ def _parse_operand(cs, cs_op, insn_obj):
 class Disassembler:
     """Capstone-based x86-32 disassembler."""
 
+    # (address, the up-to-15 bytes there) -> Instruction, or None when they
+    # do not decode. Shared by every instance: the lifter decodes each
+    # function several times over and the disasm probes build a Disassembler
+    # per probe, and turning Capstone's detail into an Instruction was most of
+    # both stages. The key holds the bytes, so a different buffer at the same
+    # address is a different entry. Instructions are not changed after
+    # _decode_instruction builds them, so callers may share them.
+    _decoded = {}
+
     def __init__(self):
-        self._cs = Cs(CS_ARCH_X86, CS_MODE_32)
+        self._cs = LazyCs(CS_ARCH_X86, CS_MODE_32)
         self._cs.detail = True
         _init_reg_names(self._cs)
+
+    def _decode_stream(self, raw_bytes, offset, limit, va):
+        """Yield the instructions decoded from raw_bytes[offset:limit] at va,
+        stopping at the first one that does not decode, as Capstone does."""
+        while offset < limit:
+            window = bytes(raw_bytes[offset:min(offset + 15, limit)])
+            key = (va, window)
+            insn = self._decoded.get(key, False)
+            if insn is False:
+                cs_insn = next(self._cs.disasm(window, va, 1), None)
+                insn = (self._decode_instruction(cs_insn)
+                        if cs_insn is not None else None)
+                self._decoded[key] = insn
+            if insn is None:
+                return
+            yield insn
+            offset += insn.size
+            va += insn.size
 
     def _decode_instruction(self, cs_insn):
         """Convert one Capstone instruction into the translator model."""
@@ -222,8 +251,8 @@ class Disassembler:
             return []
 
         decoded = {}
-        for cs_insn in self._cs.disasm(raw_bytes[:size], start_va):
-            decoded[cs_insn.address] = self._decode_instruction(cs_insn)
+        for insn in self._decode_stream(raw_bytes, 0, size, start_va):
+            decoded[insn.address] = insn
 
         for point in sorted(resync or ()):
             if not (start_va <= point < end_va) or point in decoded:
@@ -231,9 +260,9 @@ class Disassembler:
             for addr in [a for a, i in decoded.items()
                          if a < point < a + i.size]:
                 del decoded[addr]
-            for cs_insn in self._cs.disasm(raw_bytes[point - start_va:size],
-                                           point):
-                if cs_insn.address in decoded:
+            for insn in self._decode_stream(raw_bytes, point - start_va,
+                                            size, point):
+                if insn.address in decoded:
                     break          # rejoined a stream we already have
                 # The misaligned stream did not only straddle `point`: until
                 # it rejoins, every instruction it decoded starts *inside* one
@@ -242,46 +271,12 @@ class Disassembler:
                 # memcpy the `44` inside `mov [edi+ecx*4-0x1C], eax` survived
                 # as `inc esp`, so every short copy returned with esp one byte
                 # off and popped garbage into the caller's esi and edi.
-                for inner in range(cs_insn.address + 1,
-                                   cs_insn.address + cs_insn.size):
+                for inner in range(insn.address + 1,
+                                   insn.address + insn.size):
                     decoded.pop(inner, None)
-                decoded[cs_insn.address] = self._decode_instruction(cs_insn)
+                decoded[insn.address] = insn
 
         return [decoded[a] for a in sorted(decoded)]
-
-    # Capstone's disasm() decodes the whole buffer it is given, with details,
-    # before it yields the first instruction. The CFG walk below stops at the
-    # next jump, a few instructions in, so handing it everything up to end_va
-    # decoded the rest of the range once per entry: quadratic, and 785 of the
-    # 855 seconds of a cold disassembly of Nightfire's default.xbe, where
-    # FunctionDetector probes whole gaps this way. _stream reads a window at a
-    # time instead.
-    _WINDOW = 512
-    _MAX_INSN = 15          # longest x86 instruction
-
-    def _stream(self, raw_bytes, start_va, offset, size):
-        """The instructions of raw_bytes[offset:size] (raw_bytes[0] at
-        start_va), exactly as one disasm() over the whole range yields them,
-        ending at the first undecodable byte. Only an instruction starting at
-        least _MAX_INSN bytes before a window's end is passed on, so each was
-        decoded with all its bytes present; the next window starts at the
-        first one that was not."""
-        while offset < size:
-            end = min(size, offset + self._WINDOW)
-            sure = size if end == size else end - self._MAX_INSN
-            pos = offset
-            for cs_insn in self._cs.disasm(raw_bytes[offset:end], start_va + offset):
-                at = cs_insn.address - start_va
-                if at >= sure:
-                    break
-                yield cs_insn
-                pos = at + cs_insn.size
-            else:
-                if pos < sure:      # an undecodable byte, or the end
-                    return
-            if pos == offset:
-                return
-            offset = pos
 
     def disassemble_cfg(self, raw_bytes, start_va, end_va, entry_points,
                         stop_addresses=None, stop_mnemonics=()):
@@ -298,12 +293,11 @@ class Disassembler:
             if not (start_va <= entry < end_va) or entry in decoded:
                 continue
             offset = entry - start_va
-            for cs_insn in self._stream(raw_bytes, start_va, offset, size):
-                if cs_insn.address != entry and cs_insn.address in stop_addresses:
+            for insn in self._decode_stream(raw_bytes, offset, size, entry):
+                if insn.address != entry and insn.address in stop_addresses:
                     break
-                if cs_insn.address >= end_va or cs_insn.address in decoded:
+                if insn.address >= end_va or insn.address in decoded:
                     break
-                insn = self._decode_instruction(cs_insn)
                 decoded[insn.address] = insn
 
                 if (insn.is_cond_jump and insn.jump_target is not None
