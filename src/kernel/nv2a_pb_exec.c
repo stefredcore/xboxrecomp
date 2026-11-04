@@ -42,6 +42,11 @@
 #include "nv2a_backend.h"
 #if defined(_WIN32)
 #include <windows.h>
+#endif
+/* Keyed on the compiler, not the target (see xbox_winnt.h): Clang and GCC for
+ * Windows ignore __declspec(thread) with a warning, and the state became one
+ * process-wide variable. */
+#if defined(_MSC_VER)
 #define NV_TLS __declspec(thread)
 #else
 #define NV_TLS __thread

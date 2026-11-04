@@ -29,6 +29,11 @@
  */
 #include "nv2a_vsh_interp.h"
 
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
 /* What oFog holds before the program writes it: on the hardware, what the
  * program left there for the vertex run after the last draw (the executor's
  * carry_after_draw, as xemu's carryover). (0,0,0,1) at reset. */
@@ -43,11 +48,6 @@ const float *nv2a_vsh_carry_fog(void)
 {
     return s_carry_fog;
 }
-
-#include <math.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
 static uint32_t s_program[NV2A_VSH_SLOTS][4];
 static float    s_const[NV2A_VSH_CONSTANTS][4];

@@ -10,8 +10,8 @@
  * That decoder existed twice before this file -- once in nv2a_mmio_hook.c and
  * once in apu_mmio_hook.c -- as the same opcode table written out against two
  * different pairs of accessors. This is the same logic with the accessors
- * passed in, so a third device does not need a third copy. The APU hook has
- * since moved onto it; nv2a_mmio_hook.c still carries its own copy.
+ * passed in, so a third device does not need a third copy. The APU, OHCI and
+ * NV2A hooks all use it now.
  *
  * Header-only and static inline: one function, one caller per device, and a
  * library for it would be more build wiring than code.

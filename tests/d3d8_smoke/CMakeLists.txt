@@ -14,7 +14,8 @@ if(WIN32)
     target_include_directories(d3d8_smoke PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d
     )
-    target_link_libraries(d3d8_smoke PRIVATE platform d3d11 dxgi dxguid d3dcompiler)
+    target_link_libraries(d3d8_smoke PRIVATE platform d3d11 dxgi dxguid
+        $<IF:$<BOOL:${MINGW}>,d3dcompiler_47,d3dcompiler>)
     if(MSVC)
         target_compile_options(d3d8_smoke PRIVATE /W3)
     endif()
@@ -34,5 +35,6 @@ if(WIN32)
         ../../src/d3d/d3d8_combiners.c
     )
     target_include_directories(d3d8_a8 PRIVATE ../../src/d3d)
-    target_link_libraries(d3d8_a8 PRIVATE platform d3d11 dxgi dxguid d3dcompiler)
+    target_link_libraries(d3d8_a8 PRIVATE platform d3d11 dxgi dxguid
+        $<IF:$<BOOL:${MINGW}>,d3dcompiler_47,d3dcompiler>)
 endif()

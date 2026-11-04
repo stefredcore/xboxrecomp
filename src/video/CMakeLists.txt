@@ -15,7 +15,8 @@ if(WIN32)
     # gpu_present.c: the framebuffer window's D3D11 presenter.
     target_sources(xbox_video PRIVATE gpu_present.c)
     target_link_libraries(xbox_video PUBLIC mfplat mfreadwrite mfuuid mf ole32
-                          d3d11 dxgi dxguid d3dcompiler)
+                          d3d11 dxgi dxguid
+                          $<IF:$<BOOL:${MINGW}>,d3dcompiler_47,d3dcompiler>)
 else()
     # The framebuffer window on POSIX hosts: SDL2, on the process main thread
     # (fb_present_sdl.c), which then also pumps the events the game
