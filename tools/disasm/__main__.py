@@ -95,6 +95,14 @@ def main():
              "default.",
     )
 
+    parser.add_argument(
+        "--no-listings",
+        action="store_true",
+        help="Write only the JSON databases, not the asm/*.asm listings. The "
+             "listings are for reading; no later stage uses them, and on a "
+             "large title they are tens of MB of formatting.",
+    )
+
     args = parser.parse_args()
 
     try:
@@ -123,6 +131,7 @@ def main():
             seed_functions=seed_funcs,
             observed_seeds=observed,
             skip_library_immediates=args.skip_library_immediates,
+            listings=not args.no_listings,
         )
         success = disassembler.run()
         sys.exit(0 if success else 1)

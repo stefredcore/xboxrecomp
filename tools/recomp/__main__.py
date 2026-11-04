@@ -284,6 +284,10 @@ def main():
                              "a loop that makes no kernel call; it costs a "
                              "load and a branch per edge when the lock is "
                              "off. Off by default: edges stay bare")
+    parser.add_argument("-j", "--jobs", type=int, default=0, metavar="N",
+                        help="Processes that translate functions side by side "
+                             "with --split (default 0: one per CPU; 1: all in "
+                             "this process). The output is the same either way")
     parser.add_argument("--seh-prolog", metavar="ADDR",
                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
     parser.add_argument("--seh-epilog", metavar="ADDR",
@@ -513,6 +517,7 @@ def main():
                   + (f"; {len(wrap & known)} wrapped as sub_X_gen" if wrap else ""),
                   file=sys.stderr)
 
+        translator.jobs = args.jobs
         stats = translator.translate_batch_split(
             funcs,
             output_dir=gen_dir,

@@ -3215,6 +3215,33 @@ class FunctionTranslator:
         return regs
 
 
+_WORKER = None
+
+
+def _translate_worker_init(blob):
+    """A lift worker process: restore the translator and module state that
+    BatchTranslator._translate_all wrote to `blob`."""
+    global _WORKER, ENTRY_HOOKS
+    import pickle
+    with open(blob, "rb") as f:
+        config_state, entry_hooks, translator, work = pickle.load(f)
+    vars(_config).update(config_state)
+    ENTRY_HOOKS = entry_hooks
+    _WORKER = (translator, work)
+
+
+def _translate_worker_run(span):
+    """Translate work[lo:hi]; return the codes and the run's own tallies."""
+    translator, work = _WORKER
+    lifter = translator.lifter
+    lifter.referenced_calls = {}
+    lifter.unimplemented = {}
+    lo, hi = span
+    codes = [translator.translate_function(addr, func_info)
+             for addr, func_info in work[lo:hi]]
+    return codes, lifter.referenced_calls, lifter.unimplemented
+
+
 class BatchTranslator:
     """Translates multiple functions and writes C source files."""
 
@@ -3486,6 +3513,75 @@ class BatchTranslator:
 
         return all_stats
 
+    # Worker processes for translate_batch_split: 0 = one per CPU. Set from
+    # --jobs; 1 translates in this process.
+    jobs = 0
+
+    def _translate_all(self, work, verbose=False):
+        """translate_function for each (addr, name, func_info) of `work`, in
+        order; returns the code (or None) of each.
+
+        Functions translate independently of each other: what the lifter
+        carries from one to the next is only the two tallies, referenced_calls
+        and unimplemented. So the list is cut into contiguous runs, the runs
+        go to worker processes, each with its own copy of the translator, and
+        the results and tallies are joined back in list order -- the same
+        output, byte for byte, as translating them here one after another.
+        """
+        jobs = self.jobs or os.cpu_count() or 1
+        jobs = min(jobs, max(1, len(work) // 200))
+        if jobs <= 1:
+            codes = []
+            for i, (addr, name, func_info) in enumerate(work):
+                if verbose and (i % 500 == 0 or i == len(work) - 1):
+                    print(f"  [{i+1}/{len(work)}] Translating {name}...",
+                          file=sys.stderr)
+                codes.append(self.translator.translate_function(addr, func_info))
+            return codes
+
+        import multiprocessing
+        import pickle
+        import tempfile
+        import types
+
+        # Everything a worker needs, written once to a file each worker
+        # reads: the translator, the work list, and the module state the
+        # command line set up (the section layout, the game name, the
+        # manual entry hooks).
+        config_state = {
+            k: v for k, v in vars(_config).items()
+            if not k.startswith("__") and not callable(v)
+            and not isinstance(v, types.ModuleType)}
+        lifter = self.translator.lifter
+        fd, blob = tempfile.mkstemp(prefix="recomp_", suffix=".pickle")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                pickle.dump((config_state, ENTRY_HOOKS, self.translator,
+                             [(a, fi) for a, _, fi in work]),
+                            f, protocol=pickle.HIGHEST_PROTOCOL)
+            # Several runs per worker even out functions of unequal size.
+            runs = jobs * 4
+            step = -(-len(work) // runs)
+            spans = [(lo, min(lo + step, len(work)))
+                     for lo in range(0, len(work), step)]
+            print(f"  translating in {jobs} processes", file=sys.stderr)
+            codes = []
+            ctx = multiprocessing.get_context("spawn")
+            with ctx.Pool(jobs, initializer=_translate_worker_init,
+                          initargs=(blob,)) as pool:
+                for run_codes, calls, unimpl in pool.imap(
+                        _translate_worker_run, spans):
+                    codes.extend(run_codes)
+                    lifter.referenced_calls.update(calls)
+                    for m, addrs in unimpl.items():
+                        lifter.unimplemented.setdefault(m, []).extend(addrs)
+                    if verbose:
+                        print(f"  [{len(codes)}/{len(work)}] translated",
+                              file=sys.stderr)
+            return codes
+        finally:
+            os.unlink(blob)
+
     def translate_batch_split(self, func_list, output_dir, chunk_size=1000,
                               header_name="recomp_funcs.h",
                               prefix="recomp", verbose=False, manual=None):
@@ -3530,18 +3626,18 @@ class BatchTranslator:
             "total_lines": 0,
         }
 
-        for i, (addr, func_info) in enumerate(func_list):
+        work = []
+        for addr, func_info in func_list:
             name = _func_ident(addr, func_info.get("name", f"sub_{addr:08X}"))
-            if verbose and (i % 500 == 0 or i == len(func_list) - 1):
-                print(f"  [{i+1}/{len(func_list)}] Translating {name}...",
-                      file=sys.stderr)
-
             if addr in manual:
                 # Hand-written elsewhere: declare it, emit nothing.
                 manual_decls[addr] = name
-                continue
+            else:
+                work.append((addr, name, func_info))
 
-            code = self.translator.translate_function(addr, func_info)
+        codes = self._translate_all(work, verbose)
+
+        for (addr, name, func_info), code in zip(work, codes):
             if code:
                 translations.append((addr, name, code))
                 stats["translated"] += 1

@@ -155,6 +155,20 @@ class Disassembler:
         self._cs.detail = True
         _init_reg_names(self._cs)
 
+    # The translator travels to the lift's worker processes by pickle
+    # (BatchTranslator.translate_batch_split); a Capstone handle cannot, so
+    # each process opens its own.
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        del state["_cs"]
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._cs = Cs(CS_ARCH_X86, CS_MODE_32)
+        self._cs.detail = True
+        _init_reg_names(self._cs)
+
     def _decode_instruction(self, cs_insn):
         """Convert one Capstone instruction into the translator model."""
         insn = Instruction(

@@ -4,6 +4,7 @@ Main disassembly orchestrator.
 Coordinates all analysis passes and produces the final output.
 """
 
+import os
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -40,8 +41,11 @@ class Disassembler:
                  extra_sections: Optional[list] = None,
                  seed_functions: Optional[list] = None,
                  observed_seeds: Optional[set] = None,
-                 skip_library_immediates: bool = False):
+                 skip_library_immediates: bool = False,
+                 listings: bool = True):
         self.xbe_path = xbe_path
+        # The asm/*.asm listings are for people; no later stage reads them.
+        self.listings = listings
         self.analysis_json = analysis_json
         self.output_dir = output_dir or config.DEFAULT_OUTPUT_DIR
         self.text_only = text_only
@@ -84,7 +88,11 @@ class Disassembler:
 
         # Check cache
         cache = AnalysisCache(self.output_dir)
-        if not self.force:
+        # A cached run made with --no-listings cannot serve one that wants them.
+        wants_missing_listings = (
+            self.listings and not self.stats_only and
+            not os.path.isdir(os.path.join(self.output_dir, "asm")))
+        if not self.force and not wants_missing_listings:
             json_path = self._find_analysis_json()
             if json_path and cache.is_valid(self.xbe_path, json_path,
                                              self.text_only,
@@ -259,7 +267,8 @@ class Disassembler:
             writer = OutputWriter(
                 self.output_dir, self.engine, self.func_detector,
                 self.xrefs, self.labels, self.image, self.strings)
-            writer.write_all(sections_to_disasm=sections, verbose=self.verbose)
+            writer.write_all(sections_to_disasm=sections if self.listings else None,
+                             verbose=self.verbose)
 
             # Save cache
             json_path = self._find_analysis_json()
