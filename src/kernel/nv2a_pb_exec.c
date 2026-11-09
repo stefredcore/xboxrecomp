@@ -979,6 +979,20 @@ static void current_render_state(Nv2aRenderState *r)
     r->poly_offset_factor = reg_f(0x0384);           /* SET_POLYGON_OFFSET_SCALE_FACTOR */
     r->poly_offset_units = reg_f(0x0388);            /* SET_POLYGON_OFFSET_BIAS */
     r->z_perspective     = (s_reg[0x0290 / 4] >> 16) & 1; /* SET_CONTROL0 */
+    /* SET_WINDOW_CLIP_*[0]: min in bits 0-11, max (inclusive) in 16-27, in
+     * the title's pixels. Type 0 keeps drawing inside, 1 outside; only the
+     * first is handed on. Both words 0 (never sent) means no clip. */
+    {
+        uint32_t h = s_reg[0x02C0 / 4], v = s_reg[0x02E0 / 4];
+        uint32_t sx = s_gpu.aa_sx > 1.5f ? 2 : 1, sy = s_gpu.aa_sy > 1.5f ? 2 : 1;
+        r->window_clip = (h | v) != 0 && s_reg[0x02B4 / 4] == 0;
+        r->window_x0 = (h & 0xFFF) * sx;
+        r->window_x1 = (((h >> 16) & 0xFFF) + 1) * sx;
+        r->window_y0 = (v & 0xFFF) * sy;
+        r->window_y1 = (((v >> 16) & 0xFFF) + 1) * sy;
+        if (r->window_x1 <= r->window_x0 || r->window_y1 <= r->window_y0)
+            r->window_clip = 0;
+    }
 }
 
 static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);

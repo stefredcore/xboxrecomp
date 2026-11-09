@@ -13,6 +13,7 @@
 #include "xinput_xbox.h"
 #include "keyboard.h"
 #include "mkb_input.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -68,25 +69,92 @@ static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
 /* The keyboard on port 0 (RECOMP_KEYBOARD=1) comes from keyboard.c, shared
  * with the SDL backend; the GDI window in fb_present.c records the keys. */
 
+/* Which host pad drives which Xbox port.
+ *
+ * XInput's slot is not the player: Windows gives a pad whatever slot is free
+ * when it connects, so with another pad (or a virtual one) connected first,
+ * the only pad in the room can sit in slot 1 while Xbox port 0, player 1,
+ * read slot 0 and saw nothing. A host pad now takes the lowest free Xbox port
+ * when it is first seen and keeps it until it is unplugged, as plugging into
+ * the next free port of a console would; slots are looked at in their order.
+ *
+ * Empty slots are slow to ask (XInput searches for the device each time), so
+ * the unassigned ones are looked at twice a second, not on every poll. The
+ * ports are read from the USB model's thread and the title's; a lock keeps the
+ * two tables in step. */
+static int   s_host_of[XBOX_MAX_CONTROLLERS] = { -1, -1, -1, -1 };  /* port -> slot */
+static int   s_port_of[XBOX_MAX_CONTROLLERS] = { -1, -1, -1, -1 };  /* slot -> port */
+static DWORD s_last_scan;
+static int   s_scanned;
+static SRWLOCK s_map_lock = SRWLOCK_INIT;
+
+static void pad_map_scan(void)
+{
+    DWORD now = GetTickCount();
+    int slot, port;
+
+    if (s_scanned && now - s_last_scan < 500)
+        return;
+    s_scanned = 1;
+    s_last_scan = now;
+    for (slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++) {
+        XINPUT_STATE st;
+        if (s_port_of[slot] >= 0 || XInputGetState((DWORD)slot, &st) != ERROR_SUCCESS)
+            continue;
+        for (port = 0; port < XBOX_MAX_CONTROLLERS && s_host_of[port] >= 0; port++)
+            ;
+        if (port == XBOX_MAX_CONTROLLERS)
+            break;
+        s_host_of[port] = slot;
+        s_port_of[slot] = port;
+        fprintf(stderr, "  [PAD] host pad %d -> Xbox port %d\n", slot, port);
+        fflush(stderr);
+    }
+}
+
+/* The host slot for an Xbox port, or -1. */
+static int pad_map_slot(DWORD port)
+{
+    int slot;
+    AcquireSRWLockExclusive(&s_map_lock);
+    pad_map_scan();
+    slot = s_host_of[port];
+    ReleaseSRWLockExclusive(&s_map_lock);
+    return slot;
+}
+
+/* The pad on that slot is gone: its port is free for the next one. */
+static void pad_map_drop(int slot)
+{
+    AcquireSRWLockExclusive(&s_map_lock);
+    if (slot >= 0 && s_port_of[slot] >= 0) {
+        fprintf(stderr, "  [PAD] host pad %d left Xbox port %d\n", slot, s_port_of[slot]);
+        fflush(stderr);
+        s_host_of[s_port_of[slot]] = -1;
+        s_port_of[slot] = -1;
+    }
+    ReleaseSRWLockExclusive(&s_map_lock);
+}
+
 void xbox_InputInit(void)
 {
-    for (DWORD i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
-        XINPUT_STATE state;
-        DWORD result = XInputGetState(i, &state);
-        g_controller_connected[i] = (result == ERROR_SUCCESS);
-    }
+    for (DWORD i = 0; i < XBOX_MAX_CONTROLLERS; i++)
+        g_controller_connected[i] = pad_map_slot(i) >= 0;
 }
 
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
-    XINPUT_STATE xi_state;
+    XINPUT_STATE xi_state = { 0 };
     DWORD result;
+    int slot;
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
 
-    result = XInputGetState(dwPort, &xi_state);
+    slot = pad_map_slot(dwPort);
+    result = slot >= 0 ? XInputGetState((DWORD)slot, &xi_state) : ERROR_DEVICE_NOT_CONNECTED;
     if (result != ERROR_SUCCESS) {
+        pad_map_drop(slot);
         g_controller_connected[dwPort] = FALSE;
         if (dwPort == 0) {
             /* Keyboard and mouse stand in for an absent pad, so the game is
@@ -146,13 +214,17 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 {
     XINPUT_VIBRATION xi_vib;
+    int slot;
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
+        return ERROR_DEVICE_NOT_CONNECTED;
+    slot = pad_map_slot(dwPort);
+    if (slot < 0)
         return ERROR_DEVICE_NOT_CONNECTED;
 
     xi_vib.wLeftMotorSpeed = pVibration->wLeftMotorSpeed;
     xi_vib.wRightMotorSpeed = pVibration->wRightMotorSpeed;
-    return XInputSetState(dwPort, &xi_vib);
+    return XInputSetState((DWORD)slot, &xi_vib);
 }
 
 BOOL xbox_InputIsConnected(DWORD dwPort)
@@ -165,11 +237,15 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 {
     XINPUT_CAPABILITIES xi_caps;
     DWORD result;
+    int slot;
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pCaps)
         return ERROR_DEVICE_NOT_CONNECTED;
+    slot = pad_map_slot(dwPort);
+    if (slot < 0)
+        return ERROR_DEVICE_NOT_CONNECTED;
 
-    result = XInputGetCapabilities(dwPort, dwFlags, &xi_caps);
+    result = XInputGetCapabilities((DWORD)slot, dwFlags, &xi_caps);
     if (result != ERROR_SUCCESS) return result;
 
     memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));

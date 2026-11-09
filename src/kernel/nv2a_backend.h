@@ -110,9 +110,19 @@ typedef struct {
      * Linear in distance, so far away it still tells apart two surfaces a
      * z-buffer of the same width cannot. */
     uint32_t z_perspective;
+    /* SET_WINDOW_CLIP_HORIZONTAL/VERTICAL[0] with SET_WINDOW_CLIP_TYPE
+     * inclusive: drawing is kept to x0 <= x < x1, y0 <= y < y1, in surface
+     * pixels (the anti-aliasing factor applied). window_clip is 0 when no
+     * such rectangle applies. A split-screen title draws each player's view
+     * through the whole viewport math and confines it with this; a back end
+     * that ignores it lets one player's triangles reach into the other's
+     * half. */
+    uint32_t window_clip;
+    uint32_t window_x0, window_x1, window_y0, window_y1;
 } Nv2aRenderState;
 #define NV2A_BACKEND_POLY_OFFSET 1   /* the three fields above exist */
 #define NV2A_BACKEND_Z_PERSPECTIVE 1 /* z_perspective exists */
+#define NV2A_BACKEND_WINDOW_CLIP 1   /* window_clip and its rectangle exist */
 
 /* Everything the CPU rasteriser interpolates per pixel when the register
  * combiners are in use (xf_rows in nv2a_pb_exec.c): both vertex colours, the
