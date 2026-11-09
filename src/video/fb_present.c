@@ -877,6 +877,10 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                     wc.hCursor = blank;
             }
         }
+        /* The program's own icon, when it carries one as resource 1 (a game
+         * project's .rc); else NULL, Windows' default. Shown in the title
+         * bar, the taskbar and Alt+Tab. */
+        wc.hIcon = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(1));
         wc.lpszClassName = "XboxRecompFramebuffer";
         RegisterClassA(&wc);
     }
