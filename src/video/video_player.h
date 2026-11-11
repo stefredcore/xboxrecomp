@@ -74,7 +74,8 @@ void xbox_FramebufferWindowSetAAKernel(uint32_t kernel);
  * handles given out is written at a time, never the one given out last. */
 typedef struct {
     void    *handle;            /* IDXGIResource::GetSharedHandle */
-    uint32_t scale;             /* the texture is the surface times this */
+    uint32_t scale;             /* the texture is the surface times this ... */
+    uint32_t scale_x;           /* ... across this, if not 0 (else scale too) */
 } XboxFramebufferGpuFrame;
 typedef int (*XboxFramebufferGpu)(uint32_t fb_va, uint32_t pitch,
                                   XboxFramebufferGpuFrame *out);

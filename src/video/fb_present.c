@@ -525,7 +525,11 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
     s_present_gpu[next].f.handle = NULL;
     if (s_gpu_frame) {
         GpuFrame g;
-        if (s_gpu_frame(fb_va, pitch, &g.f) && g.f.handle && g.f.scale > 1) {
+        g.f.scale_x = 0;
+        if (s_gpu_frame(fb_va, pitch, &g.f) && g.f.handle
+                && (g.f.scale > 1 || g.f.scale_x > 1)) {
+            if (!g.f.scale_x)
+                g.f.scale_x = g.f.scale;
             g.mode = aa_mode(bpp);
             g.aa_sy = s_fb_aa_sy;
             s_present_gpu[next] = g;
@@ -1006,7 +1010,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             gpu_present_set_aspect(video ? (float)s_fb_width / (float)s_fb_height
                                          : s_present_aspect[idx]);
             if (!video && g.f.handle && gpu_present_active())
-                shown = gpu_present_shared(g.f.handle, s_fb_width * g.f.scale,
+                shown = gpu_present_shared(g.f.handle, s_fb_width * g.f.scale_x,
                                            s_fb_height * g.f.scale, s_fb_height,
                                            g.mode, g.aa_sy);
             paced = shown >= 0 ? shown : fb_show(hwnd, hdc, &bi);
