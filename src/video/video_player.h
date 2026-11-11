@@ -76,6 +76,8 @@ typedef struct {
     void    *handle;            /* IDXGIResource::GetSharedHandle */
     uint32_t scale;             /* the texture is the surface times this ... */
     uint32_t scale_x;           /* ... across this, if not 0 (else scale too) */
+    float    fx, fy;            /* the exact factors, if not 0 (a monitor's size
+                                 * need not be a whole multiple) */
 } XboxFramebufferGpuFrame;
 typedef int (*XboxFramebufferGpu)(uint32_t fb_va, uint32_t pitch,
                                   XboxFramebufferGpuFrame *out);
