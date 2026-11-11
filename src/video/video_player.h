@@ -78,7 +78,11 @@ typedef struct {
     uint32_t scale_x;           /* ... across this, if not 0 (else scale too) */
     float    fx, fy;            /* the exact factors, if not 0 (a monitor's size
                                  * need not be a whole multiple) */
+    uint32_t flags;             /* XBOX_GPU_FRAME_* */
 } XboxFramebufferGpuFrame;
+/* The texture holds the surface without its anti-aliasing samples, drawn
+ * at the shown size: shown as it is, not resolved. */
+#define XBOX_GPU_FRAME_RESOLVED 1u
 typedef int (*XboxFramebufferGpu)(uint32_t fb_va, uint32_t pitch,
                                   XboxFramebufferGpuFrame *out);
 void xbox_FramebufferWindowSetGpu(XboxFramebufferGpu fn);

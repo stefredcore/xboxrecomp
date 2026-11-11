@@ -527,6 +527,7 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
         GpuFrame g;
         g.f.scale_x = 0;
         g.f.fx = g.f.fy = 0.0f;
+        g.f.flags = 0;
         if (s_gpu_frame(fb_va, pitch, &g.f) && g.f.handle
                 && (g.f.scale > 1 || g.f.scale_x > 1 || g.f.fx > 0.0f)) {
             if (!g.f.scale_x)
@@ -535,8 +536,8 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
                 g.f.fx = (float)g.f.scale_x;
                 g.f.fy = (float)g.f.scale;
             }
-            g.mode = aa_mode(bpp);
-            g.aa_sy = s_fb_aa_sy;
+            g.mode = (g.f.flags & XBOX_GPU_FRAME_RESOLVED) ? 0 : aa_mode(bpp);
+            g.aa_sy = (g.f.flags & XBOX_GPU_FRAME_RESOLVED) ? 1 : s_fb_aa_sy;
             s_present_gpu[next] = g;
         }
     }
