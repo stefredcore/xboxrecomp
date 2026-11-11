@@ -2906,8 +2906,49 @@ static void xf_queue_push(const XfTri *T)
 
 static int batch_uses_program(void);
 
+static void raster_xf_triangle_snapped(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+                                       const Nv2aVshOutput *vc);
+
+/* The rasteriser's 1/16-pixel grid. The NV2A sets triangles up from screen
+ * positions in 4-bit subpixels, cut toward zero (as xemu's roundScreenCoords
+ * does). It matters at a pixel centre: Xbox D3D draws a full-surface quad
+ * from 0.53125 (its pixel offset), which the grid makes 0.5 -- the edge runs
+ * through the first pixel's centre and the top-left rule takes it in. Kept
+ * at 0.53125, column 0 and row 0 were never drawn: the driving missions'
+ * glow fades a buffer it never clears with such a quad, and a light's glow
+ * that reached its first column or row stayed there for good, growing into
+ * coloured stripes at the left and top of the screen.
+ * RECOMP_SUBPIXEL_SNAP=0 leaves positions as they are. */
+static int subpixel_snap_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_SUBPIXEL_SNAP");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
 static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                                const Nv2aVshOutput *vc)
+{
+    Nv2aVshOutput s[3];
+    int k;
+
+    if (!subpixel_snap_on()) {
+        raster_xf_triangle_snapped(va, vb, vc);
+        return;
+    }
+    s[0] = *va; s[1] = *vb; s[2] = *vc;
+    for (k = 0; k < 3; k++) {
+        s[k].pos[0] = truncf(s[k].pos[0] * 16.0f) / 16.0f;
+        s[k].pos[1] = truncf(s[k].pos[1] * 16.0f) / 16.0f;
+    }
+    raster_xf_triangle_snapped(&s[0], &s[1], &s[2]);
+}
+
+static void raster_xf_triangle_snapped(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+                                       const Nv2aVshOutput *vc)
 {
     XfTri T;
     XfCount cnt = {0, 0, 0};
