@@ -85,6 +85,17 @@ int xbox_FlipHoldPoll(XboxFlipHold *h, uint32_t count, uint64_t now_ns,
         return 0;
     if ((int32_t)(count - h->target) >= 0) {
         release(h, now_ns, 1);
+        /* Shown at this vblank, not at the target it missed. Left at the
+         * target, a run of late frames -- a loading screen, a stall --
+         * put last_flip vblanks behind the count, and every frame after
+         * it found its target already past and went at once: no hold at
+         * all until the frames caught up. Nightfire's driving image, which
+         * paces itself at 16 ms on a 60 Hz console, then flipped 62.5 times
+         * a second against 60 vblanks and ran 4% fast. A late frame still
+         * goes at once; the next waits for the vblank after it, as D3D's
+         * flip at a vblank does. */
+        if ((int32_t)(count - h->last_flip) > 0)
+            h->last_flip = count;
         return 0;
     }
     if (!clock_ok) {
